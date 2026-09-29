@@ -1214,11 +1214,7 @@ def get_demo_analysis():
 # DISPLAY HELPERS
 # ============================================================
 
-
-def render_finding_card(
-    finding,
-    score
-):
+def render_finding_card(finding, score):
 
     description = FINDING_INFO.get(
         finding,
@@ -1228,28 +1224,26 @@ def render_finding_card(
         "The model produced a score for this finding."
     )
 
+    html = f"""
+<div class="finding-card">
+    <div class="finding-title">{finding}</div>
+
+    <div class="metric-label">
+        Research model score
+    </div>
+
+    <div class="finding-score">
+        {format_percentage(score)}
+    </div>
+
+    <div class="finding-caption">
+        {description}
+    </div>
+</div>
+"""
+
     st.markdown(
-        f"""
-        <div class="finding-card">
-
-            <div class="finding-title">
-                {finding}
-            </div>
-
-            <div class="metric-label">
-                Research model score
-            </div>
-
-            <div class="finding-score">
-                {format_percentage(score)}
-            </div>
-
-            <div class="finding-caption">
-                {description}
-            </div>
-
-        </div>
-        """,
+        html,
         unsafe_allow_html=True
     )
 
