@@ -1,43 +1,38 @@
 import io
-import json
 import os
 import re
-import uuid
+import json
+from datetime import datetime
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 from PIL import Image
-
 
 # ============================================================
 # PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Multimodal Medical Report Visualizer",
-    page_icon="🩻",
+    page_title="Multimodal Radiology Analysis",
+    page_icon=None,
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-
 # ============================================================
-# CONFIGURATION
+# APPLICATION CONSTANTS
 # ============================================================
 
 VISION_MODEL = os.getenv(
     "VISION_MODEL",
-    "itsomk/chexpert-densenet121",
+    "itsomk/chexpert-densenet121"
 )
 
 NLP_MODEL = os.getenv(
     "NLP_MODEL",
-    "d4data/biomedical-ner-all",
+    "d4data/biomedical-ner-all"
 )
-
-
-# ============================================================
-# CHEXPERT LABELS
-# ============================================================
 
 CHEXPERT_LABELS = [
     "No Finding",
@@ -56,166 +51,429 @@ CHEXPERT_LABELS = [
     "Support Devices",
 ]
 
-
-VISION_TO_CANONICAL = {
-    "no finding": "no_finding",
-    "enlarged cardiomediastinum": "enlarged_cardiomediastinum",
-    "cardiomegaly": "cardiomegaly",
-    "lung opacity": "lung_opacity",
-    "lung lesion": "lung_lesion",
-    "edema": "edema",
-    "consolidation": "consolidation",
-    "pneumonia": "pneumonia",
-    "atelectasis": "atelectasis",
-    "pneumothorax": "pneumothorax",
-    "pleural effusion": "pleural_effusion",
-    "pleural other": "pleural_other",
-    "fracture": "fracture",
-    "support devices": "support_devices",
-}
-
+# These are display/exploration thresholds.
+# They are NOT clinical decision thresholds.
+DISPLAY_THRESHOLD = 0.20
 
 # ============================================================
-# RADIOLOGY VOCABULARY
+# CLINICAL FINDING KNOWLEDGE
+# ============================================================
+
+FINDING_INFO = {
+    "No Finding": {
+        "plain": "The image model did not identify a strong pattern corresponding to the listed chest abnormalities.",
+        "category": "General",
+    },
+    "Enlarged Cardiomediastinum": {
+        "plain": "The model identified a pattern that may correspond to increased width or size of structures in the central chest.",
+        "category": "Cardiac / Mediastinal",
+    },
+    "Cardiomegaly": {
+        "plain": "The model identified a pattern that may correspond to an enlarged cardiac silhouette.",
+        "category": "Cardiac",
+    },
+    "Lung Opacity": {
+        "plain": "The model identified a region of increased lung density or whiteness.",
+        "category": "Lung",
+    },
+    "Lung Lesion": {
+        "plain": "The model identified a pattern that may correspond to a focal abnormal area in the lung.",
+        "category": "Lung",
+    },
+    "Edema": {
+        "plain": "The model identified a pattern that can be associated with fluid-related changes in the lungs.",
+        "category": "Lung",
+    },
+    "Consolidation": {
+        "plain": "The model identified a pattern of increased lung density that can occur with consolidation.",
+        "category": "Lung",
+    },
+    "Pneumonia": {
+        "plain": "The model identified an image pattern that can occur in pneumonia. This model score alone cannot establish that pneumonia is present.",
+        "category": "Lung",
+    },
+    "Atelectasis": {
+        "plain": "The model identified a pattern that can be associated with partial collapse or reduced expansion of part of the lung.",
+        "category": "Lung",
+    },
+    "Pneumothorax": {
+        "plain": "The model identified a pattern that can be associated with air outside the lung within the chest cavity.",
+        "category": "Pleural",
+    },
+    "Pleural Effusion": {
+        "plain": "The model identified a pattern that can be associated with fluid around the lung.",
+        "category": "Pleural",
+    },
+    "Pleural Other": {
+        "plain": "The model identified a pattern involving the pleural region that does not specifically correspond to pleural effusion.",
+        "category": "Pleural",
+    },
+    "Fracture": {
+        "plain": "The model identified a pattern that may correspond to a bone abnormality or fracture.",
+        "category": "Musculoskeletal",
+    },
+    "Support Devices": {
+        "plain": "The model identified a pattern that may correspond to a medical device visible on the radiograph.",
+        "category": "Devices",
+    },
+}
+
+# ============================================================
+# REPORT TERMINOLOGY
 # ============================================================
 
 REPORT_TERMS = {
+    "cardiomegaly": "Cardiomegaly",
+    "enlarged heart": "Cardiomegaly",
+    "cardiac enlargement": "Cardiomegaly",
 
-    "lung opacity": (
-        "lung_opacity",
-        "An area of the lung looks different or denser "
-        "than surrounding lung tissue.",
-    ),
+    "pleural effusion": "Pleural Effusion",
+    "pleural fluid": "Pleural Effusion",
+    "effusion": "Pleural Effusion",
 
-    "airspace opacity": (
-        "lung_opacity",
-        "An area of the lung appears denser "
-        "than surrounding lung tissue.",
-    ),
+    "pneumothorax": "Pneumothorax",
+    "collapsed lung": "Pneumothorax",
 
-    "opacity": (
-        "lung_opacity",
-        "An area that looks different from surrounding "
-        "lung tissue.",
-    ),
+    "pneumonia": "Pneumonia",
 
-    "cardiomegaly": (
-        "cardiomegaly",
-        "The heart appears larger than usual.",
-    ),
+    "lung opacity": "Lung Opacity",
+    "pulmonary opacity": "Lung Opacity",
+    "airspace opacity": "Lung Opacity",
+    "air space opacity": "Lung Opacity",
 
-    "pleural effusion": (
-        "pleural_effusion",
-        "Extra fluid is described around the lung.",
-    ),
+    "consolidation": "Consolidation",
+    "airspace consolidation": "Consolidation",
+    "air space consolidation": "Consolidation",
 
-    "pneumothorax": (
-        "pneumothorax",
-        "Air is described in the space around the lung.",
-    ),
+    "atelectasis": "Atelectasis",
+    "subsegmental atelectasis": "Atelectasis",
+    "basilar atelectasis": "Atelectasis",
+    "linear atelectasis": "Atelectasis",
 
-    "consolidation": (
-        "consolidation",
-        "An area of lung is described as abnormally dense.",
-    ),
+    "pulmonary edema": "Edema",
+    "interstitial edema": "Edema",
+    "edema": "Edema",
 
-    "pneumonia": (
-        "pneumonia",
-        "The report uses the term pneumonia.",
-    ),
+    "lung lesion": "Lung Lesion",
+    "pulmonary lesion": "Lung Lesion",
+    "lung mass": "Lung Lesion",
+    "pulmonary mass": "Lung Lesion",
+    "nodule": "Lung Lesion",
+    "pulmonary nodule": "Lung Lesion",
 
-    "atelectasis": (
-        "atelectasis",
-        "Part of the lung is described as partially "
-        "collapsed or under-expanded.",
-    ),
+    "fracture": "Fracture",
+    "rib fracture": "Fracture",
 
-    "edema": (
-        "edema",
-        "The report describes fluid-related changes.",
-    ),
-
-    "lung lesion": (
-        "lung_lesion",
-        "A focal abnormality in the lung is described.",
-    ),
-
-    "pleural other": (
-        "pleural_other",
-        "Another abnormality involving the pleural "
-        "space is described.",
-    ),
-
-    "fracture": (
-        "fracture",
-        "A fracture is described.",
-    ),
-
-    "support device": (
-        "support_devices",
-        "A medical support device is described.",
-    ),
+    "support device": "Support Devices",
+    "support devices": "Support Devices",
+    "central line": "Support Devices",
+    "endotracheal tube": "Support Devices",
+    "feeding tube": "Support Devices",
 }
-
 
 NEGATION_PATTERNS = [
     r"\bno\b",
     r"\bwithout\b",
     r"\bnegative for\b",
     r"\babsence of\b",
-    r"\bfree of\b",
+    r"\babsent\b",
     r"\bnot seen\b",
     r"\bnot identified\b",
     r"\bno evidence of\b",
+    r"\bwithout evidence of\b",
+    r"\bfree of\b",
 ]
-
 
 UNCERTAINTY_PATTERNS = [
     r"\bpossible\b",
     r"\bpossibly\b",
     r"\bmay represent\b",
+    r"\bmay reflect\b",
     r"\bcannot exclude\b",
+    r"\bcannot rule out\b",
     r"\bsuspicious for\b",
     r"\bquestion of\b",
-    r"\bconcerning for\b",
+    r"\bquestionable\b",
+    r"\bconsider\b",
+    r"\bperhaps\b",
 ]
 
-
 # ============================================================
-# CUSTOM CSS
+# CSS
 # ============================================================
 
 st.markdown(
     """
 <style>
 
+:root {
+    --primary: #1f5f9c;
+    --primary-dark: #164873;
+    --text: #172033;
+    --muted: #657084;
+    --border: #dce2ea;
+    --surface: #ffffff;
+    --surface-soft: #f6f8fb;
+    --success: #2d6a4f;
+    --warning: #946200;
+    --danger: #9b3434;
+}
+
+html, body, [class*="css"] {
+    font-family:
+        Inter,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+}
+
+.stApp {
+    background: #ffffff;
+    color: var(--text);
+}
+
 .block-container {
-    max-width: 1450px;
+    max-width: 1380px;
     padding-top: 2rem;
-    padding-bottom: 3rem;
+    padding-bottom: 4rem;
 }
 
-.hero {
-    padding: 1.7rem 1.8rem;
-    border: 1px solid rgba(128,128,128,.22);
-    border-radius: 20px;
-    background:
-        linear-gradient(
-            135deg,
-            rgba(37,99,235,.10),
-            rgba(14,165,233,.05)
-        );
+h1, h2, h3, h4 {
+    color: var(--text);
+    letter-spacing: -0.02em;
 }
 
-.muted {
-    color: #6b7280;
+h1 {
+    font-size: 2.4rem !important;
+    font-weight: 700 !important;
+}
+
+h2 {
+    font-size: 1.55rem !important;
+    font-weight: 650 !important;
+}
+
+h3 {
+    font-size: 1.15rem !important;
+    font-weight: 650 !important;
+}
+
+p {
+    color: var(--text);
+    line-height: 1.65;
+}
+
+[data-testid="stSidebar"] {
+    background: #f7f9fc;
+    border-right: 1px solid var(--border);
+}
+
+[data-testid="stSidebar"] * {
+    color: var(--text);
+}
+
+.app-kicker {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--primary);
+    margin-bottom: 0.45rem;
+}
+
+.app-title {
+    font-size: 2.45rem;
+    line-height: 1.12;
+    font-weight: 750;
+    letter-spacing: -0.04em;
+    margin-bottom: 0.6rem;
+}
+
+.app-subtitle {
+    color: var(--muted);
+    font-size: 1.02rem;
+    max-width: 900px;
+    line-height: 1.65;
+}
+
+.section-label {
+    color: var(--primary);
+    font-size: 0.75rem;
+    font-weight: 750;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    margin-top: 1.5rem;
+    margin-bottom: 0.35rem;
+}
+
+.section-description {
+    color: var(--muted);
+    font-size: 0.92rem;
+    margin-bottom: 1rem;
+}
+
+.surface {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+}
+
+.soft-surface {
+    border: 1px solid var(--border);
+    background: var(--surface-soft);
+    border-radius: 12px;
+    padding: 1.15rem;
+    margin-bottom: 1rem;
+}
+
+.finding-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: white;
+    padding: 1.15rem;
+    min-height: 190px;
+    margin-bottom: 1rem;
+}
+
+.finding-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 0.4rem;
+}
+
+.finding-score {
+    font-size: 1.8rem;
+    font-weight: 650;
+    color: var(--text);
+}
+
+.finding-caption {
+    color: var(--muted);
+    font-size: 0.83rem;
+    line-height: 1.5;
+    margin-top: 0.6rem;
+}
+
+.evidence-box {
+    background: #f8fafc;
+    border-left: 3px solid var(--primary);
+    padding: 0.9rem 1rem;
+    border-radius: 0 8px 8px 0;
+    margin: 0.6rem 0;
+}
+
+.evidence-label {
+    color: var(--muted);
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.evidence-text {
+    color: var(--text);
+    font-size: 0.9rem;
+    margin-top: 0.25rem;
+}
+
+.status-consistent {
+    color: var(--success);
+    font-weight: 700;
+}
+
+.status-difference {
+    color: var(--warning);
+    font-weight: 700;
+}
+
+.status-report {
+    color: #315f91;
+    font-weight: 700;
+}
+
+.status-uncertain {
+    color: #805d19;
+    font-weight: 700;
+}
+
+.status-neutral {
+    color: var(--muted);
+    font-weight: 650;
+}
+
+.metric-label {
+    color: var(--muted);
+    font-size: 0.77rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+}
+
+.metric-value {
+    color: var(--text);
+    font-size: 1.6rem;
+    font-weight: 700;
 }
 
 .disclaimer {
+    border: 1px solid #e2e5e9;
+    background: #fafafa;
+    border-radius: 10px;
     padding: 1rem 1.1rem;
-    border-radius: 14px;
-    background: rgba(245,158,11,.10);
-    border: 1px solid rgba(245,158,11,.25);
+    color: #555f6d;
+    font-size: 0.83rem;
+    line-height: 1.6;
+    margin-top: 1rem;
+}
+
+.small-note {
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.55;
+}
+
+.method-box {
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+    margin-top: 1rem;
+}
+
+[data-testid="stFileUploader"] {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.stButton > button {
+    border-radius: 8px;
+    border: 1px solid #cbd4df;
+    font-weight: 600;
+}
+
+.stButton > button[kind="primary"] {
+    background: var(--primary);
+    border-color: var(--primary);
+}
+
+.stButton > button[kind="primary"]:hover {
+    background: var(--primary-dark);
+    border-color: var(--primary-dark);
+}
+
+[data-testid="stMetric"] {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.8rem;
+    background: white;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2rem 0;
 }
 
 </style>
@@ -223,38 +481,70 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "last_analysis" not in st.session_state:
+    st.session_state.last_analysis = None
 
 # ============================================================
-# VISION MODEL
+# UTILITY FUNCTIONS
 # ============================================================
+
+
+def safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def format_percentage(value):
+    return f"{safe_float(value) * 100:.1f}%"
+
+
+def clean_text(text):
+    if not text:
+        return ""
+
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_term(term):
+    if not term:
+        return None
+
+    term = term.lower().strip()
+
+    if term in REPORT_TERMS:
+        return REPORT_TERMS[term]
+
+    return None
+
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
 
 @st.cache_resource(show_spinner=False)
 def load_vision_model():
 
-    """
-    Loads the actual CheXpert DenseNet-121 checkpoint.
-
-    The Hugging Face repository contains a PyTorch/
-    torchvision DenseNet-121 checkpoint stored as
-    pytorch_model.safetensors.
-
-    Therefore we load it directly instead of using
-    transformers.pipeline().
-    """
-
     import torch
-
-    from torchvision import models, transforms
-
-    from safetensors.torch import load_file
-
+    import torchvision.models as models
+    import torchvision.transforms as transforms
     from huggingface_hub import hf_hub_download
-
+    from safetensors.torch import load_file
 
     class DenseNet121CheXpert(torch.nn.Module):
 
         def __init__(self, num_labels=14):
-
             super().__init__()
 
             self.densenet = models.densenet121(
@@ -267,86 +557,40 @@ def load_vision_model():
 
             self.densenet.classifier = torch.nn.Linear(
                 num_features,
-                num_labels,
+                num_labels
             )
 
         def forward(self, x):
-
             return self.densenet(x)
 
-
-    # --------------------------------------------------------
-    # Download checkpoint from Hugging Face
-    # --------------------------------------------------------
+    model = DenseNet121CheXpert(
+        num_labels=len(CHEXPERT_LABELS)
+    )
 
     checkpoint_path = hf_hub_download(
         repo_id=VISION_MODEL,
         filename="pytorch_model.safetensors",
     )
 
+    state_dict = load_file(checkpoint_path)
 
-    # --------------------------------------------------------
-    # Create model architecture
-    # --------------------------------------------------------
-
-    model = DenseNet121CheXpert(
-        num_labels=14
+    model.load_state_dict(
+        state_dict,
+        strict=False
     )
-
-
-    # --------------------------------------------------------
-    # Load safetensors checkpoint
-    # --------------------------------------------------------
-
-    state_dict = load_file(
-        checkpoint_path
-    )
-
-
-    missing_keys, unexpected_keys = (
-        model.load_state_dict(
-            state_dict,
-            strict=False,
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Safety check
-    # --------------------------------------------------------
-
-    if len(state_dict) < 100:
-
-        raise RuntimeError(
-            "The CheXpert checkpoint did not load "
-            "correctly. The downloaded checkpoint "
-            "contains unexpectedly few parameters."
-        )
-
 
     model.eval()
 
-
-    # --------------------------------------------------------
-    # Image preprocessing
-    # --------------------------------------------------------
-
-    preprocess = transforms.Compose(
+    transform = transforms.Compose(
         [
-
-            transforms.Resize(
-                (224, 224)
-            ),
-
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
-
             transforms.Normalize(
                 mean=[
                     0.485,
                     0.456,
                     0.406,
                 ],
-
                 std=[
                     0.229,
                     0.224,
@@ -356,1305 +600,723 @@ def load_vision_model():
         ]
     )
 
-
-    return (
-        model,
-        preprocess,
-        torch,
-    )
+    return model, transform
 
 
 # ============================================================
-# X-RAY INFERENCE
+# X-RAY ANALYSIS
 # ============================================================
 
-def analyze_xray(
-    image_bytes
-):
 
-    """
-    Runs real multi-label inference on
-    the uploaded chest X-ray.
-    """
+def analyze_xray(image_bytes):
+
+    import torch
 
     image = Image.open(
         io.BytesIO(image_bytes)
     ).convert("RGB")
 
+    model, transform = load_vision_model()
 
-    model, preprocess, torch = (
-        load_vision_model()
-    )
-
-
-    tensor = preprocess(
-        image
-    ).unsqueeze(0)
-
-
-    # --------------------------------------------------------
-    # Inference
-    # --------------------------------------------------------
+    tensor = transform(image).unsqueeze(0)
 
     with torch.inference_mode():
 
-        logits = model(
-            tensor
-        )
+        logits = model(tensor)
 
-        probabilities = (
-            torch.sigmoid(
-                logits
-            )
-            .squeeze(0)
-            .tolist()
-        )
+        probabilities = torch.sigmoid(
+            logits
+        )[0].cpu().numpy()
 
-
-    findings = []
-
+    results = []
 
     for label, probability in zip(
         CHEXPERT_LABELS,
-        probabilities,
+        probabilities
     ):
 
-        canonical_name = (
-            VISION_TO_CANONICAL[
-                label.lower()
-            ]
-        )
-
-
-        probability = float(
-            probability
-        )
-
-
-        findings.append(
+        results.append(
             {
-
-                "name":
-                    canonical_name,
-
-                "display_name":
-                    label,
-
-                "probability":
-                    probability,
-
-                "status":
-                    (
-                        "elevated"
-                        if probability >= 0.5
-                        else "low"
-                    ),
-
-                "source":
-                    "Hugging Face CheXpert DenseNet-121",
-
-                "explanation":
-                    (
-                        "Pretrained chest-X-ray "
-                        "model output. This probability "
-                        "is not a clinical diagnosis."
-                    ),
+                "finding": label,
+                "probability": float(probability),
             }
         )
 
-
-    findings.sort(
-        key=lambda item:
-            item["probability"],
-        reverse=True,
+    results.sort(
+        key=lambda x: x["probability"],
+        reverse=True
     )
 
-
-    return findings
+    return results
 
 
 # ============================================================
 # PDF EXTRACTION
 # ============================================================
 
-def extract_pdf_text(
-    file_bytes
-):
 
-    try:
+def extract_pdf_text(file_bytes):
 
-        import fitz
+    import fitz
 
+    text_parts = []
 
-        document = fitz.open(
-            stream=file_bytes,
-            filetype="pdf",
+    document = fitz.open(
+        stream=file_bytes,
+        filetype="pdf"
+    )
+
+    for page in document:
+        text_parts.append(
+            page.get_text()
         )
 
+    document.close()
 
-        pages = []
-
-
-        for page in document:
-
-            pages.append(
-                page.get_text()
-            )
-
-
-        return "\n".join(
-            pages
-        ).strip()
-
-
-    except Exception:
-
-        return ""
+    return "\n".join(text_parts)
 
 
 # ============================================================
-# REPORT FILE READING
+# REPORT PARSING
 # ============================================================
 
-def read_report(
-    uploaded_file
+
+def get_local_context(text, start, end, window=90):
+
+    left = max(0, start - window)
+    right = min(
+        len(text),
+        end + window
+    )
+
+    return text[left:right]
+
+
+def context_has_negation(context):
+
+    context_lower = context.lower()
+
+    for pattern in NEGATION_PATTERNS:
+
+        if re.search(
+            pattern,
+            context_lower
+        ):
+            return True
+
+    return False
+
+
+def context_has_uncertainty(context):
+
+    context_lower = context.lower()
+
+    for pattern in UNCERTAINTY_PATTERNS:
+
+        if re.search(
+            pattern,
+            context_lower
+        ):
+            return True
+
+    return False
+
+
+def classify_report_mention(
+    context
 ):
 
-    if uploaded_file is None:
-
-        return ""
-
-
-    file_bytes = (
-        uploaded_file.getvalue()
-    )
-
-
-    filename = (
-        uploaded_file.name.lower()
-    )
-
-
-    if filename.endswith(
-        ".pdf"
+    if context_has_negation(
+        context
     ):
+        return "NEGATED"
 
-        return extract_pdf_text(
-            file_bytes
-        )
+    if context_has_uncertainty(
+        context
+    ):
+        return "UNCERTAIN"
 
-
-    return file_bytes.decode(
-        "utf-8",
-        errors="ignore",
-    )
+    return "MENTIONED"
 
 
-# ============================================================
-# REPORT NLP
-# ============================================================
+def parse_report(text):
 
-def extract_report_findings(
-    report_text
-):
+    text = clean_text(text)
 
-    text = " ".join(
-        report_text.split()
-    )
+    findings = {}
 
-    lower_text = text.lower()
+    for term, canonical in REPORT_TERMS.items():
 
+        pattern = re.escape(term)
 
-    findings = []
-
-
-    for term, (
-        canonical_name,
-        plain_language,
-    ) in REPORT_TERMS.items():
-
-
-        matches = list(
-            re.finditer(
-                re.escape(term),
-                lower_text,
-            )
-        )
-
-
-        if not matches:
-
-            continue
-
-
-        match = matches[0]
-
-
-        start = max(
-            0,
-            match.start() - 100,
-        )
-
-
-        end = min(
-            len(lower_text),
-            match.end() + 140,
-        )
-
-
-        context = (
-            lower_text[
-                start:end
-            ]
-        )
-
-
-        # ----------------------------------------------------
-        # Negation detection
-        # ----------------------------------------------------
-
-        negated = any(
-            re.search(
-                pattern,
-                context,
-            )
-            for pattern
-            in NEGATION_PATTERNS
-        )
-
-
-        # ----------------------------------------------------
-        # Uncertainty detection
-        # ----------------------------------------------------
-
-        uncertain = any(
-            re.search(
-                pattern,
-                context,
-            )
-            for pattern
-            in UNCERTAINTY_PATTERNS
-        )
-
-
-        if negated:
-
-            status = "absent"
-
-        elif uncertain:
-
-            status = "uncertain"
-
-        else:
-
-            status = "present"
-
-
-        evidence = (
-            text[
-                start:end
-            ].strip()
-        )
-
-
-        # ----------------------------------------------------
-        # Basic anatomical location
-        # ----------------------------------------------------
-
-        location = None
-
-
-        location_patterns = [
-
-            (
-                "right lower",
-                "right lower lung",
-            ),
-
-            (
-                "left lower",
-                "left lower lung",
-            ),
-
-            (
-                "right upper",
-                "right upper lung",
-            ),
-
-            (
-                "left upper",
-                "left upper lung",
-            ),
-
-            (
-                "right middle",
-                "right middle lung",
-            ),
-
-            (
-                "left mid",
-                "left mid lung",
-            ),
-        ]
-
-
-        for phrase, readable in (
-            location_patterns
+        for match in re.finditer(
+            pattern,
+            text,
+            flags=re.IGNORECASE
         ):
 
-            if phrase in context:
-
-                location = readable
-
-                break
-
-
-        findings.append(
-            {
-
-                "name":
-                    canonical_name,
-
-                "display_name":
-                    term.title(),
-
-                "status":
-                    status,
-
-                "location":
-                    location,
-
-                "evidence":
-                    evidence,
-
-                "plain_language":
-                    plain_language,
-            }
-        )
-
-
-    # --------------------------------------------------------
-    # Remove duplicate canonical findings
-    # --------------------------------------------------------
-
-    unique_findings = {}
-
-
-    for finding in findings:
-
-        if finding["name"] not in unique_findings:
-
-            unique_findings[
-                finding["name"]
-            ] = finding
-
-
-    findings = list(
-        unique_findings.values()
-    )
-
-
-    # --------------------------------------------------------
-    # Biomedical NER fallback
-    # --------------------------------------------------------
-
-    if not findings:
-
-        try:
-
-            from transformers import pipeline
-
-
-            ner_pipeline = pipeline(
-                "token-classification",
-                model=NLP_MODEL,
-                aggregation_strategy="simple",
+            context = get_local_context(
+                text,
+                match.start(),
+                match.end()
             )
 
-
-            entities = ner_pipeline(
-                text[:4000]
+            status = classify_report_mention(
+                context
             )
 
-
-            for entity in entities[:20]:
-
-                word = (
-                    entity
-                    .get("word", "")
-                    .strip()
-                )
-
-
-                if not word:
-
-                    continue
-
-
-                findings.append(
-                    {
-
-                        "name":
-                            word.lower()
-                            .replace(
-                                " ",
-                                "_",
-                            ),
-
-                        "display_name":
-                            word,
-
-                        "status":
-                            "uncertain",
-
-                        "location":
-                            None,
-
-                        "evidence":
-                            word,
-
-                        "plain_language":
-                            (
-                                "A biomedical term "
-                                "identified in the report. "
-                                "Its clinical meaning "
-                                "requires context."
-                            ),
-                    }
-                )
-
-
-        except Exception:
-
-            pass
-
-
-    # --------------------------------------------------------
-    # Nothing identified
-    # --------------------------------------------------------
-
-    if not findings:
-
-        findings.append(
-            {
-
-                "name":
-                    "no_normalized_findings",
-
-                "display_name":
-                    "No normalized findings",
-
-                "status":
-                    "uncertain",
-
-                "location":
-                    None,
-
-                "evidence":
-                    "",
-
-                "plain_language":
-                    (
-                        "The prototype did not identify "
-                        "one of its supported radiology "
-                        "finding patterns."
-                    ),
-            }
-        )
-
-
-    return findings
-
-
-# ============================================================
-# MULTIMODAL FUSION
-# ============================================================
-
-def compare_findings(
-    vision_findings,
-    report_findings,
-):
-
-    report_map = {
-
-        finding["name"]:
-            finding
-
-        for finding
-        in report_findings
-
-        if finding["name"]
-        != "no_normalized_findings"
-    }
-
-
-    comparisons = []
-
-
-    for vision in vision_findings:
-
-        name = vision["name"]
-
-
-        if name == "no_finding":
-
-            continue
-
-
-        probability = float(
-            vision["probability"]
-        )
-
-
-        image_positive = (
-            probability >= 0.5
-        )
-
-
-        if name not in report_map:
-
-            relationship = (
-                "not_mentioned"
-            )
-
-            report_status = (
-                "not mentioned"
-            )
-
-
-        else:
-
-            report_status = (
-                report_map[name]["status"]
-            )
-
-
-            if report_status == "uncertain":
-
-                relationship = "uncertain"
-
-
-            elif (
-                image_positive
-                and
-                report_status == "present"
-            ):
-
-                relationship = "consistent"
-
-
-            elif (
-                not image_positive
-                and
-                report_status == "absent"
-            ):
-
-                relationship = "consistent"
-
+            if canonical not in findings:
+
+                findings[canonical] = {
+                    "finding": canonical,
+                    "status": status,
+                    "evidence": context.strip(),
+                }
 
             else:
 
+                current = findings[canonical]
+
+                # Prefer explicit negation/uncertainty
+                # over generic mention if encountered.
+                priority = {
+                    "NEGATED": 3,
+                    "UNCERTAIN": 2,
+                    "MENTIONED": 1,
+                }
+
+                if (
+                    priority.get(status, 0)
+                    >
+                    priority.get(
+                        current["status"],
+                        0
+                    )
+                ):
+
+                    findings[canonical] = {
+                        "finding": canonical,
+                        "status": status,
+                        "evidence": context.strip(),
+                    }
+
+    return list(findings.values())
+
+
+# ============================================================
+# OPTIONAL BIOMEDICAL NER
+# ============================================================
+
+
+@st.cache_resource(show_spinner=False)
+def load_ner_pipeline():
+
+    from transformers import pipeline
+
+    return pipeline(
+        "token-classification",
+        model=NLP_MODEL,
+        aggregation_strategy="simple"
+    )
+
+
+def run_optional_ner(text):
+
+    """
+    NER is used only as a supplementary extraction layer.
+    The application's normalized finding dictionary remains
+    the primary deterministic parser.
+    """
+
+    if not text.strip():
+        return []
+
+    try:
+
+        ner = load_ner_pipeline()
+
+        entities = ner(
+            text[:12000]
+        )
+
+        return entities
+
+    except Exception:
+
+        return []
+
+
+# ============================================================
+# CROSS-MODAL COMPARISON
+# ============================================================
+
+
+def build_comparison(
+    vision_results,
+    report_findings
+):
+
+    report_map = {
+        item["finding"]: item
+        for item in report_findings
+    }
+
+    comparison = []
+
+    for item in vision_results:
+
+        finding = item["finding"]
+        score = safe_float(
+            item["probability"]
+        )
+
+        report = report_map.get(
+            finding
+        )
+
+        if report is None:
+
+            comparison.append(
+                {
+                    "finding": finding,
+                    "image_score": score,
+                    "report_status": "NOT_MENTIONED",
+                    "relationship": "NOT_MENTIONED",
+                    "evidence": "",
+                }
+            )
+
+            continue
+
+        report_status = report[
+            "status"
+        ]
+
+        if report_status == "MENTIONED":
+
+            relationship = "CONSISTENT"
+
+        elif report_status == "NEGATED":
+
+            if score >= DISPLAY_THRESHOLD:
                 relationship = (
-                    "potential_difference"
+                    "POTENTIAL_DIFFERENCE"
+                )
+            else:
+                relationship = (
+                    "CONSISTENT"
                 )
 
+        elif report_status == "UNCERTAIN":
 
-        comparisons.append(
+            relationship = "UNCERTAIN"
+
+        else:
+
+            relationship = "REVIEW"
+
+        comparison.append(
             {
-
-                "finding":
-                    name,
-
-                "display_name":
-                    vision["display_name"],
-
-                "image_probability":
-                    probability,
-
-                "image":
-                    f"{probability:.0%}",
-
-                "report":
-                    report_status,
-
-                "relationship":
-                    relationship,
+                "finding": finding,
+                "image_score": score,
+                "report_status": report_status,
+                "relationship": relationship,
+                "evidence": report.get(
+                    "evidence",
+                    ""
+                ),
             }
         )
 
+    # Add report findings not represented
+    # in the top vision results.
+    vision_names = {
+        item["finding"]
+        for item in vision_results
+    }
 
-    return comparisons
+    for report in report_findings:
+
+        if report["finding"] not in vision_names:
+
+            comparison.append(
+                {
+                    "finding": report["finding"],
+                    "image_score": None,
+                    "report_status": report[
+                        "status"
+                    ],
+                    "relationship": (
+                        "REPORT_ONLY"
+                    ),
+                    "evidence": report.get(
+                        "evidence",
+                        ""
+                    ),
+                }
+            )
+
+    return comparison
 
 
 # ============================================================
 # PLAIN LANGUAGE EXPLANATION
 # ============================================================
 
-def deterministic_summary(
+
+def generate_plain_language_summary(
+    vision_findings,
     report_findings,
-    comparisons,
+    comparison
 ):
 
-    present = [
+    strong_vision = []
 
-        finding["display_name"]
+    for item in vision_findings:
 
-        for finding
-        in report_findings
-
-        if finding["status"]
-        == "present"
-    ]
-
-
-    absent = [
-
-        finding["display_name"]
-
-        for finding
-        in report_findings
-
-        if finding["status"]
-        == "absent"
-    ]
-
-
-    consistent = [
-
-        finding["display_name"]
-
-        for finding
-        in comparisons
-
-        if finding["relationship"]
-        == "consistent"
-    ]
-
-
-    parts = []
-
-
-    if present:
-
-        parts.append(
-            "The written report describes: "
-            + ", ".join(present)
-            + "."
-        )
-
-
-    if absent:
-
-        parts.append(
-            "The report specifically describes "
-            "as absent: "
-            + ", ".join(absent)
-            + "."
-        )
-
-
-    if consistent:
-
-        parts.append(
-            "The image-model outputs are directionally "
-            "consistent with the written report for: "
-            + ", ".join(consistent)
-            + "."
-        )
-
-
-    if not parts:
-
-        parts.append(
-            "The prototype could not generate "
-            "a detailed plain-language summary "
-            "from the supplied information."
-        )
-
-
-    parts.append(
-        "This is an AI-assisted educational explanation. "
-        "It is not a medical diagnosis and should not "
-        "be used for treatment or clinical decision-making."
-    )
-
-
-    return " ".join(
-        parts
-    )
-
-
-# ============================================================
-# OPTIONAL LLM EXPLANATION
-# ============================================================
-
-def generate_explanation(
-    report_findings,
-    comparisons,
-):
-
-    api_key = os.getenv(
-        "LLM_API_KEY"
-    )
-
-
-    provider = os.getenv(
-        "LLM_PROVIDER",
-        "",
-    ).lower()
-
-
-    # --------------------------------------------------------
-    # Free default mode
-    # --------------------------------------------------------
-
-    if (
-        not api_key
-        or provider != "openai"
-    ):
-
-        return deterministic_summary(
-            report_findings,
-            comparisons,
-        )
-
-
-    # --------------------------------------------------------
-    # Optional OpenAI API
-    # --------------------------------------------------------
-
-    try:
-
-        from openai import OpenAI
-
-
-        client = OpenAI(
-            api_key=api_key
-        )
-
-
-        structured_data = {
-
-            "report_findings":
-                report_findings,
-
-            "image_report_comparisons":
-                comparisons,
-        }
-
-
-        response = (
-            client
-            .chat
-            .completions
-            .create(
-
-                model=os.getenv(
-                    "LLM_MODEL",
-                    "gpt-5-mini",
-                ),
-
-                messages=[
-
-                    {
-                        "role":
-                            "system",
-
-                        "content":
-                            (
-                                "Explain radiology "
-                                "information for a general "
-                                "audience. The written "
-                                "clinician report is the "
-                                "primary source. AI image "
-                                "outputs are predictions, "
-                                "not diagnoses. Do not "
-                                "invent findings, provide "
-                                "treatment advice, or "
-                                "claim clinical accuracy."
-                            ),
-                    },
-
-                    {
-                        "role":
-                            "user",
-
-                        "content":
-                            json.dumps(
-                                structured_data,
-                                ensure_ascii=False,
-                            ),
-                    },
-                ],
-
-                temperature=0.1,
+        score = safe_float(
+            item.get(
+                "probability",
+                item.get(
+                    "score",
+                    0
+                )
             )
         )
 
-
-        return (
-            response
-            .choices[0]
-            .message
-            .content
-            .strip()
+        name = (
+            item.get("finding")
+            or item.get("label")
+            or item.get("name")
         )
 
+        if (
+            name
+            and score >= DISPLAY_THRESHOLD
+            and name != "No Finding"
+        ):
 
-    except Exception:
+            strong_vision.append(
+                (name, score)
+            )
 
-        return deterministic_summary(
-            report_findings,
-            comparisons,
+    strong_vision.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    paragraphs = []
+
+    if strong_vision:
+
+        paragraphs.append(
+            "The image model identified several "
+            "radiographic patterns that it considered "
+            "worth highlighting."
         )
+
+        for name, score in strong_vision[:5]:
+
+            description = FINDING_INFO.get(
+                name,
+                {}
+            ).get(
+                "plain",
+                f"The model identified a pattern associated with {name.lower()}."
+            )
+
+            paragraphs.append(
+                f"**{name} ({format_percentage(score)} model score):** "
+                f"{description}"
+            )
+
+    else:
+
+        paragraphs.append(
+            "The image model did not produce any "
+            "higher-scoring finding above the application's "
+            "display threshold."
+        )
+
+    if report_findings:
+
+        report_items = []
+
+        for item in report_findings[:10]:
+
+            name = item["finding"]
+            status = item["status"]
+
+            if status == "MENTIONED":
+                report_items.append(
+                    f"{name} was mentioned in the report."
+                )
+
+            elif status == "NEGATED":
+                report_items.append(
+                    f"{name} was explicitly described as absent or negative."
+                )
+
+            elif status == "UNCERTAIN":
+                report_items.append(
+                    f"{name} was described with uncertainty."
+                )
+
+        if report_items:
+
+            paragraphs.append(
+                "The report-processing layer identified "
+                "the following clinically relevant statements:"
+            )
+
+            paragraphs.extend(
+                [
+                    f"- {item}"
+                    for item in report_items
+                ]
+            )
+
+    else:
+
+        paragraphs.append(
+            "The report-processing layer did not identify "
+            "a supported finding in the supplied text."
+        )
+
+    meaningful_comparisons = [
+        item
+        for item in comparison
+        if item["relationship"]
+        != "NOT_MENTIONED"
+    ]
+
+    if meaningful_comparisons:
+
+        paragraphs.append(
+            "The multimodal comparison then examined "
+            "whether findings extracted from the report "
+            "were compatible with the image-model outputs."
+        )
+
+        consistent = sum(
+            1
+            for item in meaningful_comparisons
+            if item["relationship"]
+            == "CONSISTENT"
+        )
+
+        differences = sum(
+            1
+            for item in meaningful_comparisons
+            if item["relationship"]
+            == "POTENTIAL_DIFFERENCE"
+        )
+
+        uncertain = sum(
+            1
+            for item in meaningful_comparisons
+            if item["relationship"]
+            == "UNCERTAIN"
+        )
+
+        paragraphs.append(
+            f"The current case contains {consistent} "
+            f"relationship(s) classified as consistent, "
+            f"{differences} potential cross-modal difference(s), "
+            f"and {uncertain} uncertain relationship(s)."
+        )
+
+    paragraphs.append(
+        "These results are outputs of a pretrained research "
+        "model and automated text processing. Model scores "
+        "are not calibrated clinical probabilities and do "
+        "not constitute a medical diagnosis."
+    )
+
+    paragraphs.append(
+        "The supplied radiology report should remain the "
+        "primary clinical source for interpreting the examination."
+    )
+
+    return "\n\n".join(
+        paragraphs
+    )
 
 
 # ============================================================
 # DEMO DATA
 # ============================================================
 
-def demo_result():
 
-    study_id = (
-        "DEMO-"
-        + uuid.uuid4()
-        .hex[:6]
-        .upper()
-    )
-
+def get_demo_analysis():
 
     vision = [
-
         {
-            "name":
-                "lung_opacity",
-
-            "display_name":
-                "Lung Opacity",
-
-            "probability":
-                0.78,
-
-            "status":
-                "elevated",
-
-            "source":
-                "Illustrative demo",
-
-            "explanation":
-                "Illustrative demo probability only.",
+            "finding": "Lung Opacity",
+            "probability": 0.78,
         },
-
         {
-            "name":
-                "pleural_effusion",
-
-            "display_name":
-                "Pleural Effusion",
-
-            "probability":
-                0.10,
-
-            "status":
-                "low",
-
-            "source":
-                "Illustrative demo",
-
-            "explanation":
-                "Illustrative demo probability only.",
+            "finding": "Pneumonia",
+            "probability": 0.67,
         },
-
         {
-            "name":
-                "cardiomegaly",
-
-            "display_name":
-                "Cardiomegaly",
-
-            "probability":
-                0.21,
-
-            "status":
-                "low",
-
-            "source":
-                "Illustrative demo",
-
-            "explanation":
-                "Illustrative demo probability only.",
+            "finding": "Lung Lesion",
+            "probability": 0.41,
+        },
+        {
+            "finding": "Pleural Effusion",
+            "probability": 0.18,
+        },
+        {
+            "finding": "Cardiomegaly",
+            "probability": 0.12,
         },
     ]
 
+    report_text = """
+    Frontal chest radiograph.
 
-    report = [
+    There is patchy airspace opacity in the right lower lung.
+    The cardiac silhouette is mildly enlarged.
+    No pleural effusion or pneumothorax is identified.
 
-        {
-            "name":
-                "lung_opacity",
+    IMPRESSION:
+    Right lower lung airspace opacity.
+    Mild cardiomegaly.
+    No pleural effusion.
+    """
 
-            "display_name":
-                "Lung Opacity",
+    report_findings = parse_report(
+        report_text
+    )
 
-            "status":
-                "present",
+    comparison = build_comparison(
+        vision,
+        report_findings
+    )
 
-            "location":
-                "right lower lung",
-
-            "evidence":
-                (
-                    "Patchy right lower lobe "
-                    "airspace opacity is described."
-                ),
-
-            "plain_language":
-                REPORT_TERMS[
-                    "lung opacity"
-                ][1],
-        },
-
-        {
-            "name":
-                "pleural_effusion",
-
-            "display_name":
-                "Pleural Effusion",
-
-            "status":
-                "absent",
-
-            "location":
-                None,
-
-            "evidence":
-                "No pleural effusion is described.",
-
-            "plain_language":
-                REPORT_TERMS[
-                    "pleural effusion"
-                ][1],
-        },
-    ]
-
-
-    comparisons = [
-
-        {
-            "finding":
-                "lung_opacity",
-
-            "display_name":
-                "Lung Opacity",
-
-            "image_probability":
-                0.78,
-
-            "image":
-                "78%",
-
-            "report":
-                "present",
-
-            "relationship":
-                "consistent",
-        },
-
-        {
-            "finding":
-                "pleural_effusion",
-
-            "display_name":
-                "Pleural Effusion",
-
-            "image_probability":
-                0.10,
-
-            "image":
-                "10%",
-
-            "report":
-                "absent",
-
-            "relationship":
-                "consistent",
-        },
-
-        {
-            "finding":
-                "cardiomegaly",
-
-            "display_name":
-                "Cardiomegaly",
-
-            "image_probability":
-                0.21,
-
-            "image":
-                "21%",
-
-            "report":
-                "not mentioned",
-
-            "relationship":
-                "not_mentioned",
-        },
-    ]
-
+    summary = generate_plain_language_summary(
+        vision,
+        report_findings,
+        comparison
+    )
 
     return {
-
-        "study_id":
-            study_id,
-
-        "demo":
-            True,
-
-        "summary":
-            (
-                "This illustrative case contains "
-                "a reported lung opacity and no "
-                "reported pleural effusion. The "
-                "example image-model outputs are "
-                "directionally consistent with "
-                "those example statements. These "
-                "values are synthetic and are not "
-                "a diagnosis."
-            ),
-
-        "vision_findings":
-            vision,
-
-        "report_findings":
-            report,
-
-        "comparisons":
-            comparisons,
-
-        "medical_terms":
-            [
-
-                {
-                    "term":
-                        "Lung opacity",
-
-                    "plain_language":
-                        REPORT_TERMS[
-                            "lung opacity"
-                        ][1],
-                },
-
-                {
-                    "term":
-                        "Pleural effusion",
-
-                    "plain_language":
-                        REPORT_TERMS[
-                            "pleural effusion"
-                        ][1],
-                },
-
-                {
-                    "term":
-                        "Cardiomegaly",
-
-                    "plain_language":
-                        REPORT_TERMS[
-                            "cardiomegaly"
-                        ][1],
-                },
-            ],
-
-        "limitations":
-            [
-
-                "Demo values are illustrative.",
-
-                "Model probabilities are not clinical certainty.",
-
-                "This prototype is not clinically validated.",
-            ],
-
-        "models":
-            {
-
-                "vision":
-                    VISION_MODEL,
-
-                "nlp":
-                    NLP_MODEL,
-
-                "explanation":
-                    "Deterministic / optional LLM API",
-            },
+        "vision": vision,
+        "report_findings": report_findings,
+        "comparison": comparison,
+        "report_text": report_text,
+        "summary": summary,
     }
 
 
 # ============================================================
-# COMPLETE ANALYSIS PIPELINE
+# DISPLAY HELPERS
 # ============================================================
 
-def analyze_case(
-    image_bytes,
-    report_text,
+
+def render_finding_card(
+    finding,
+    score
 ):
 
-    study_id = (
-        "STUDY-"
-        + uuid.uuid4()
-        .hex[:8]
-        .upper()
+    description = FINDING_INFO.get(
+        finding,
+        {}
+    ).get(
+        "plain",
+        "The model produced a score for this finding."
+    )
+
+    st.markdown(
+        f"""
+        <div class="finding-card">
+
+            <div class="finding-title">
+                {finding}
+            </div>
+
+            <div class="metric-label">
+                Research model score
+            </div>
+
+            <div class="finding-score">
+                {format_percentage(score)}
+            </div>
+
+            <div class="finding-caption">
+                {description}
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
 
-    # --------------------------------------------------------
-    # Computer vision
-    # --------------------------------------------------------
+def render_report_status(status):
 
-    vision_findings = analyze_xray(
-        image_bytes
-    )
-
-
-    # --------------------------------------------------------
-    # Report NLP
-    # --------------------------------------------------------
-
-    report_findings = (
-        extract_report_findings(
-            report_text
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Multimodal fusion
-    # --------------------------------------------------------
-
-    comparisons = (
-        compare_findings(
-            vision_findings,
-            report_findings,
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Explanation
-    # --------------------------------------------------------
-
-    summary = (
-        generate_explanation(
-            report_findings,
-            comparisons,
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Medical terminology
-    # --------------------------------------------------------
-
-    medical_terms = []
-
-    seen = set()
-
-
-    for finding in report_findings:
-
-        if finding["name"] in seen:
-
-            continue
-
-
-        seen.add(
-            finding["name"]
-        )
-
-
-        medical_terms.append(
-            {
-
-                "term":
-                    finding["display_name"],
-
-                "plain_language":
-                    finding["plain_language"],
-            }
-        )
-
-
-    return {
-
-        "study_id":
-            study_id,
-
-        "demo":
-            False,
-
-        "summary":
-            summary,
-
-        "vision_findings":
-            vision_findings,
-
-        "report_findings":
-            report_findings,
-
-        "comparisons":
-            comparisons,
-
-        "medical_terms":
-            medical_terms,
-
-        "limitations":
-            [
-
-                "AI observations are not diagnoses.",
-
-                "The written radiology report "
-                "is treated as the primary clinical source.",
-
-                "The 0.5 threshold is an engineering "
-                "display threshold, not a clinical threshold.",
-
-                "This prototype has not undergone "
-                "clinical validation.",
-
-            ],
-
-        "models":
-            {
-
-                "vision":
-                    VISION_MODEL,
-
-                "nlp":
-                    NLP_MODEL,
-
-                "explanation":
-                    (
-                        os.getenv(
-                            "LLM_MODEL",
-                            "Deterministic / optional LLM API",
-                        )
-                    ),
-            },
+    mapping = {
+        "MENTIONED": (
+            "Mentioned",
+            "status-report"
+        ),
+        "NEGATED": (
+            "Negated",
+            "status-neutral"
+        ),
+        "UNCERTAIN": (
+            "Uncertain",
+            "status-uncertain"
+        ),
+        "NOT_MENTIONED": (
+            "Not mentioned",
+            "status-neutral"
+        ),
     }
 
+    return mapping.get(
+        status,
+        (
+            status,
+            "status-neutral"
+        )
+    )
 
-# ============================================================
-# JSON EXPORT
-# ============================================================
 
-def export_json(
-    result
+def render_relationship(
+    relationship
 ):
 
-    return json.dumps(
-        result,
-        indent=2,
-        ensure_ascii=False,
+    mapping = {
+        "CONSISTENT": (
+            "Consistent",
+            "status-consistent"
+        ),
+        "POTENTIAL_DIFFERENCE": (
+            "Potential difference",
+            "status-difference"
+        ),
+        "UNCERTAIN": (
+            "Uncertain",
+            "status-uncertain"
+        ),
+        "REPORT_ONLY": (
+            "Report finding",
+            "status-report"
+        ),
+        "NOT_MENTIONED": (
+            "Not mentioned",
+            "status-neutral"
+        ),
+    }
+
+    return mapping.get(
+        relationship,
+        (
+            relationship,
+            "status-neutral"
+        )
     )
 
 
@@ -1662,906 +1324,1366 @@ def export_json(
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title(
-    "🩻 Medical Visualizer"
-)
-
-
-page = st.sidebar.radio(
-    "Navigate",
-    [
-
-        "Analyze",
-
-        "History",
-
-        "Evaluation",
-
-        "Models & Methodology",
-
-        "About",
-
-    ],
-)
-
-
-if "history" not in st.session_state:
-
-    st.session_state.history = []
-
-
-# ============================================================
-# ANALYZE PAGE
-# ============================================================
-
-if page == "Analyze":
+with st.sidebar:
 
     st.markdown(
         """
-<div class="hero">
+        <div class="app-kicker">
+            Independent Research Prototype
+        </div>
 
-<h1>
-Multimodal Medical Report Visualizer
-</h1>
+        <div style="
+            font-size:1.25rem;
+            font-weight:700;
+            margin-bottom:0.4rem;
+        ">
+            Multimodal Radiology Analysis
+        </div>
 
-<p>
-Explore how a pretrained chest-X-ray computer-vision
-model and biomedical report analysis can be combined
-to make radiology information easier to inspect.
-</p>
-
-</div>
-""",
-        unsafe_allow_html=True,
+        <div class="small-note">
+            Structured analysis of chest radiographs
+            and radiology reports.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
+    st.divider()
 
-    st.write("")
-
-
-    left, right = st.columns(
-        2
+    page = st.radio(
+        "Application",
+        [
+            "Analysis",
+            "Case History",
+            "Evaluation",
+            "Methodology",
+            "Models",
+            "Limitations",
+            "About",
+        ],
+        label_visibility="collapsed",
     )
 
+    st.divider()
 
-    # ========================================================
-    # X-RAY
-    # ========================================================
+    st.markdown(
+        """
+        <div class="small-note">
+        <strong>Research status</strong><br>
+        Educational prototype. Not clinically validated.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    with left:
+# ============================================================
+# PAGE: ANALYSIS
+# ============================================================
 
-        st.subheader(
-            "1. Chest X-ray"
+if page == "Analysis":
+
+    st.markdown(
+        """
+        <div class="app-kicker">
+            Multimodal Medical AI
+        </div>
+
+        <div class="app-title">
+            Multimodal Radiology Analysis
+        </div>
+
+        <div class="app-subtitle">
+            An independent research prototype that processes
+            chest radiographs and radiology reports as separate
+            information sources, then examines their relationship
+            through structured multimodal analysis.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="section-label">Case input</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="section-description">
+            Provide both components of a case for the complete
+            multimodal workflow. The radiograph is processed by
+            a pretrained chest X-ray classifier, while the report
+            is analyzed for findings, negation and uncertainty.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2 = st.columns(
+        2,
+        gap="large"
+    )
+
+    with col1:
+
+        st.markdown(
+            "### Chest radiograph"
         )
 
-
-        xray = st.file_uploader(
-            "Upload PNG / JPG / JPEG",
-
+        xray_file = st.file_uploader(
+            "Upload PNG, JPG or JPEG",
             type=[
                 "png",
                 "jpg",
                 "jpeg",
             ],
-
             key="xray_upload",
         )
 
+        if xray_file:
 
-        if xray:
+            image = Image.open(
+                xray_file
+            ).convert("RGB")
 
             st.image(
-                xray,
-
-                caption="Uploaded X-ray",
-
+                image,
+                caption="Uploaded radiograph",
                 use_container_width=True,
             )
 
+            st.markdown(
+                f"""
+                <div class="small-note">
+                    File: {xray_file.name}
+                    <br>
+                    Dimensions: {image.width} × {image.height} pixels
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-    # ========================================================
-    # REPORT
-    # ========================================================
+    with col2:
 
-    with right:
-
-        st.subheader(
-            "2. Radiology report"
+        st.markdown(
+            "### Radiology report"
         )
 
-
         report_file = st.file_uploader(
-            "Upload PDF / TXT",
-
+            "Upload PDF or TXT",
             type=[
                 "pdf",
                 "txt",
             ],
-
             key="report_upload",
         )
 
-
-        uploaded_report = (
-            read_report(
-                report_file
-            )
-        )
-
-
-        report_text = st.text_area(
+        pasted_report = st.text_area(
             "Paste or edit the report",
-
-            value=uploaded_report,
-
-            height=240,
-
+            height=230,
             placeholder=(
-                "Example: No pleural effusion. "
-                "Patchy right lower lobe opacity..."
+                "Example:\n"
+                "No pleural effusion. "
+                "Patchy right lower lung opacity..."
             ),
+            label_visibility="visible",
         )
 
+        extracted_report = ""
 
-    st.divider()
+        if report_file:
 
-
-    col1, col2, col3 = st.columns(
-        [1, 1, 2]
-    )
-
-
-    with col1:
-
-        demo_clicked = st.button(
-            "🎬 Load Demo Case",
-
-            use_container_width=True,
-        )
-
-
-    with col2:
-
-        analyze_clicked = st.button(
-            "🔬 Analyze Study",
-
-            type="primary",
-
-            use_container_width=True,
-        )
-
-
-    with col3:
-
-        st.caption(
-            "Educational/research prototype — "
-            "not a diagnostic system."
-        )
-
-
-    # ========================================================
-    # DEMO
-    # ========================================================
-
-    if demo_clicked:
-
-        result = demo_result()
-
-        st.session_state.result = result
-
-
-    # ========================================================
-    # REAL ANALYSIS
-    # ========================================================
-
-    if analyze_clicked:
-
-        if not xray:
-
-            st.error(
-                "Please upload a chest X-ray."
-            )
-
-
-        elif not report_text.strip():
-
-            st.error(
-                "Please upload or paste "
-                "a radiology report."
-            )
-
-
-        else:
-
-            with st.status(
-                "Running multimodal analysis...",
-                expanded=True,
-            ) as status:
+            if report_file.name.lower().endswith(
+                ".pdf"
+            ):
 
                 try:
 
-                    st.write(
-                        "✓ Image loaded"
+                    extracted_report = extract_pdf_text(
+                        report_file.getvalue()
                     )
-
-
-                    st.write(
-                        "✓ Report loaded"
-                    )
-
-
-                    image_bytes = (
-                        xray.getvalue()
-                    )
-
-
-                    result = analyze_case(
-                        image_bytes,
-                        report_text,
-                    )
-
-
-                    st.write(
-                        "✓ DenseNet-121 vision inference"
-                    )
-
-
-                    st.write(
-                        "✓ Report parsing / biomedical NLP"
-                    )
-
-
-                    st.write(
-                        "✓ Finding normalization"
-                    )
-
-
-                    st.write(
-                        "✓ Image ↔ report comparison"
-                    )
-
-
-                    st.write(
-                        "✓ Explanation generation"
-                    )
-
-
-                    status.update(
-                        label="Analysis complete",
-
-                        state="complete",
-                    )
-
-
-                    st.session_state.result = (
-                        result
-                    )
-
-
-                    st.session_state.history.insert(
-                        0,
-                        result,
-                    )
-
 
                 except Exception as exc:
 
-                    status.update(
-                        label="Analysis failed",
-
-                        state="error",
-                    )
-
-
                     st.error(
-                        "The live model pipeline failed."
+                        "The PDF could not be read."
                     )
 
+                    st.exception(exc)
 
-                    # This is deliberately visible so
-                    # deployment/model problems can be
-                    # diagnosed instead of hidden.
+            else:
 
-                    st.exception(
-                        exc
+                try:
+
+                    extracted_report = (
+                        report_file
+                        .getvalue()
+                        .decode(
+                            "utf-8",
+                            errors="ignore"
+                        )
                     )
 
+                except Exception:
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
+                    extracted_report = ""
 
-    result = (
-        st.session_state.get(
-            "result"
+        report_text = (
+            pasted_report.strip()
+            if pasted_report.strip()
+            else extracted_report.strip()
         )
+
+        if report_text:
+
+            with st.expander(
+                "Review extracted report",
+                expanded=False
+            ):
+
+                st.text_area(
+                    "Report text",
+                    value=report_text,
+                    height=220,
+                    key="report_preview",
+                )
+
+    st.divider()
+
+    analysis_col1, analysis_col2 = st.columns(
+        [1, 4]
     )
 
+    with analysis_col1:
 
-    if result:
+        run_analysis = st.button(
+            "Run analysis",
+            type="primary",
+            use_container_width=True,
+        )
+
+    with analysis_col2:
+
+        demo_mode = st.checkbox(
+            "Use demonstration case",
+            value=False,
+        )
+
+    if demo_mode:
+
+        demo = get_demo_analysis()
+
+        st.session_state.last_analysis = {
+            "timestamp": datetime.now().isoformat(),
+            "source": "Demonstration case",
+            **demo,
+        }
+
+        st.info(
+            "Demonstration mode uses illustrative structured data. "
+            "It is not an analysis of a real patient examination."
+        )
+
+    elif run_analysis:
+
+        if not xray_file:
+
+            st.error(
+                "Please provide a chest radiograph."
+            )
+
+        elif not report_text:
+
+            st.error(
+                "Please provide a radiology report or report text."
+            )
+
+        else:
+
+            progress = st.progress(
+                0,
+                text="Preparing analysis..."
+            )
+
+            try:
+
+                progress.progress(
+                    20,
+                    text="Processing chest radiograph..."
+                )
+
+                image_bytes = (
+                    xray_file.getvalue()
+                )
+
+                vision_results = analyze_xray(
+                    image_bytes
+                )
+
+                progress.progress(
+                    50,
+                    text="Extracting report findings..."
+                )
+
+                report_findings = parse_report(
+                    report_text
+                )
+
+                progress.progress(
+                    70,
+                    text="Building cross-modal comparison..."
+                )
+
+                comparison = build_comparison(
+                    vision_results,
+                    report_findings
+                )
+
+                progress.progress(
+                    90,
+                    text="Generating structured explanation..."
+                )
+
+                summary = generate_plain_language_summary(
+                    vision_results,
+                    report_findings,
+                    comparison
+                )
+
+                progress.progress(
+                    100,
+                    text="Analysis complete."
+                )
+
+                analysis = {
+                    "timestamp": datetime.now().isoformat(),
+                    "source": "User-provided case",
+                    "xray_filename": xray_file.name,
+                    "vision": vision_results,
+                    "report_findings": report_findings,
+                    "comparison": comparison,
+                    "report_text": report_text,
+                    "summary": summary,
+                }
+
+                st.session_state.last_analysis = analysis
+
+                st.session_state.history.append(
+                    {
+                        "timestamp": analysis[
+                            "timestamp"
+                        ],
+                        "xray": xray_file.name,
+                        "report": (
+                            report_file.name
+                            if report_file
+                            else "Pasted report"
+                        ),
+                        "findings": len(
+                            vision_results
+                        ),
+                    }
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    "The analysis pipeline encountered an error."
+                )
+
+                st.exception(exc)
+
+    # ========================================================
+    # DISPLAY ANALYSIS
+    # ========================================================
+
+    analysis = st.session_state.last_analysis
+
+    if analysis:
 
         st.divider()
 
-
-        st.header(
-            f"Study {result['study_id']}"
+        st.markdown(
+            '<div class="section-label">Image analysis</div>',
+            unsafe_allow_html=True
         )
-
-
-        if result.get("demo"):
-
-            st.info(
-                "Demo mode: all values are illustrative."
-            )
-
-
-        # ----------------------------------------------------
-        # SUMMARY
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Plain-language summary"
-        )
-
-
-        st.info(
-            result["summary"]
-        )
-
-
-        # ----------------------------------------------------
-        # AI FINDINGS
-        # ----------------------------------------------------
-
-        st.subheader(
-            "AI visual findings"
-        )
-
-
-        vision = (
-            result[
-                "vision_findings"
-            ]
-        )
-
-
-        # Display top 9 findings
-
-        top_findings = vision[:9]
-
-
-        for start in range(
-            0,
-            len(top_findings),
-            3,
-        ):
-
-            cols = st.columns(
-                3
-            )
-
-
-            for offset, col in enumerate(
-                cols
-            ):
-
-                index = (
-                    start
-                    + offset
-                )
-
-
-                if (
-                    index
-                    >= len(top_findings)
-                ):
-
-                    continue
-
-
-                finding = (
-                    top_findings[
-                        index
-                    ]
-                )
-
-
-                with col:
-
-                    with st.container(
-                        border=True
-                    ):
-
-                        st.markdown(
-                            "### "
-                            + finding[
-                                "display_name"
-                            ]
-                        )
-
-
-                        st.metric(
-                            "Model probability",
-
-                            f"{finding['probability']:.1%}",
-                        )
-
-
-                        st.progress(
-                            min(
-                                1.0,
-
-                                max(
-                                    0.0,
-
-                                    finding[
-                                        "probability"
-                                    ],
-                                ),
-                            )
-                        )
-
-
-                        st.caption(
-                            finding[
-                                "explanation"
-                            ]
-                        )
-
-
-        # ----------------------------------------------------
-        # REPORT FINDINGS
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Radiology report findings"
-        )
-
-
-        for finding in (
-            result[
-                "report_findings"
-            ]
-        ):
-
-            with st.container(
-                border=True
-            ):
-
-                st.markdown(
-                    "### "
-                    + finding[
-                        "display_name"
-                    ]
-                )
-
-
-                st.write(
-                    "**Status:** "
-                    + finding[
-                        "status"
-                    ]
-                    .replace(
-                        "_",
-                        " ",
-                    )
-                    .title()
-                )
-
-
-                if finding.get(
-                    "location"
-                ):
-
-                    st.write(
-                        "**Location:** "
-                        + finding[
-                            "location"
-                        ]
-                    )
-
-
-                if finding.get(
-                    "evidence"
-                ):
-
-                    st.caption(
-                        "Report evidence: "
-                        + finding[
-                            "evidence"
-                        ]
-                    )
-
-
-        # ----------------------------------------------------
-        # COMPARISON
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Image ↔ report comparison"
-        )
-
-
-        comparison_rows = []
-
-
-        for item in (
-            result[
-                "comparisons"
-            ]
-        ):
-
-            comparison_rows.append(
-                {
-
-                    "Finding":
-                        item[
-                            "display_name"
-                        ],
-
-                    "Image model":
-                        item[
-                            "image"
-                        ],
-
-                    "Report":
-                        item[
-                            "report"
-                        ].title(),
-
-                    "Relationship":
-                        item[
-                            "relationship"
-                        ]
-                        .replace(
-                            "_",
-                            " ",
-                        )
-                        .title(),
-                }
-            )
-
-
-        if comparison_rows:
-
-            st.dataframe(
-                pd.DataFrame(
-                    comparison_rows
-                ),
-
-                use_container_width=True,
-
-                hide_index=True,
-            )
-
-
-        st.caption(
-            "Consistent means the prototype outputs "
-            "point in the same direction for that "
-            "finding. It does not establish clinical "
-            "accuracy and does not imply that either "
-            "source is correct."
-        )
-
-
-        # ----------------------------------------------------
-        # MEDICAL TERMS
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Medical terminology"
-        )
-
-
-        for term in (
-            result[
-                "medical_terms"
-            ]
-        ):
-
-            with st.expander(
-                term["term"]
-            ):
-
-                st.write(
-                    term[
-                        "plain_language"
-                    ]
-                )
-
-
-        # ----------------------------------------------------
-        # CHART
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Model probability profile"
-        )
-
-
-        chart_data = pd.DataFrame(
-            [
-
-                {
-
-                    "Finding":
-                        item[
-                            "display_name"
-                        ],
-
-                    "Probability":
-                        item[
-                            "probability"
-                        ],
-
-                }
-
-                for item
-                in vision
-
-            ]
-        )
-
-
-        if not chart_data.empty:
-
-            st.bar_chart(
-                chart_data.set_index(
-                    "Finding"
-                )
-            )
-
-
-        # ----------------------------------------------------
-        # EXPORT
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Export"
-        )
-
-
-        st.download_button(
-            "Download JSON analysis",
-
-            data=export_json(
-                result
-            ),
-
-            file_name=(
-                f"{result['study_id']}.json"
-            ),
-
-            mime="application/json",
-        )
-
-
-        # ----------------------------------------------------
-        # DISCLAIMER
-        # ----------------------------------------------------
 
         st.markdown(
             """
-<div class="disclaimer">
+            <div class="section-description">
+                The following scores are produced independently
+                by the pretrained chest X-ray model. Multiple
+                findings can receive high scores because this is
+                a multi-label classification problem.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-<b>Responsible use:</b>
+        vision = analysis["vision"]
 
-AI observations are model outputs,
-not diagnoses.
+        top_results = [
+            item
+            for item in vision
+            if item["probability"]
+            >= DISPLAY_THRESHOLD
+        ][:9]
 
-The clinician/radiology report is
-the primary clinical source.
+        if not top_results:
 
-Do not use this application for
-treatment or medical decision-making.
+            st.info(
+                "No finding exceeded the application's "
+                "display threshold."
+            )
 
-Do not upload identifiable
-patient information.
+        else:
 
-</div>
-""",
-            unsafe_allow_html=True,
+            for start in range(
+                0,
+                len(top_results),
+                3
+            ):
+
+                row = top_results[
+                    start:start + 3
+                ]
+
+                cols = st.columns(
+                    len(row),
+                    gap="medium"
+                )
+
+                for col, item in zip(
+                    cols,
+                    row
+                ):
+
+                    with col:
+
+                        render_finding_card(
+                            item["finding"],
+                            item["probability"]
+                        )
+
+        st.markdown(
+            """
+            <div class="disclaimer">
+            <strong>Interpretation note.</strong>
+            These values are research-model outputs rather than
+            calibrated clinical probabilities. They should not be
+            interpreted as diagnoses or treatment recommendations.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # ====================================================
+        # REPORT ANALYSIS
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Report analysis</div>',
+            unsafe_allow_html=True
+        )
+
+        report_findings = analysis[
+            "report_findings"
+        ]
+
+        if not report_findings:
+
+            st.info(
+                "No supported findings were extracted from the supplied report."
+            )
+
+        else:
+
+            report_df = pd.DataFrame(
+                report_findings
+            )
+
+            report_df = report_df[
+                [
+                    "finding",
+                    "status",
+                    "evidence",
+                ]
+            ]
+
+            report_df.columns = [
+                "Finding",
+                "Report status",
+                "Evidence",
+            ]
+
+            st.dataframe(
+                report_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ====================================================
+        # CROSS MODAL
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Cross-modal analysis</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            """
+            <div class="section-description">
+                The comparison layer does not determine whether a
+                clinician or model is correct. It identifies the
+                relationship between the image-model output and
+                information explicitly extracted from the report.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        comparison = analysis[
+            "comparison"
+        ]
+
+        comparison_rows = []
+
+        for item in comparison:
+
+            score = item[
+                "image_score"
+            ]
+
+            report_status = item[
+                "report_status"
+            ]
+
+            relationship = item[
+                "relationship"
+            ]
+
+            comparison_rows.append(
+                {
+                    "Finding": item[
+                        "finding"
+                    ],
+                    "Image model score": (
+                        format_percentage(score)
+                        if score is not None
+                        else "—"
+                    ),
+                    "Report": (
+                        render_report_status(
+                            report_status
+                        )[0]
+                    ),
+                    "Relationship": (
+                        render_relationship(
+                            relationship
+                        )[0]
+                    ),
+                }
+            )
+
+        if comparison_rows:
+
+            comparison_df = pd.DataFrame(
+                comparison_rows
+            )
+
+            st.dataframe(
+                comparison_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown(
+                """
+                <div class="small-note">
+                <strong>Relationship definitions:</strong>
+                Consistent means the two information sources do not
+                show an obvious conflict under the application's
+                simple comparison rules. Potential difference means
+                the image score and report statement differ enough
+                to warrant inspection. It does not mean that either
+                source is incorrect.
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        # ====================================================
+        # EVIDENCE
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Report evidence</div>',
+            unsafe_allow_html=True
+        )
+
+        if report_findings:
+
+            for item in report_findings:
+
+                status_label, status_class = (
+                    render_report_status(
+                        item["status"]
+                    )
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="evidence-box">
+
+                        <div class="evidence-label">
+                            {item["finding"]} ·
+                            <span class="{status_class}">
+                                {status_label}
+                            </span>
+                        </div>
+
+                        <div class="evidence-text">
+                            {item["evidence"]}
+                        </div>
+
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+        # ====================================================
+        # PLAIN LANGUAGE
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Plain-language explanation</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            analysis["summary"]
+        )
+
+        # ====================================================
+        # VISUAL ANALYTICS
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Model output profile</div>',
+            unsafe_allow_html=True
+        )
+
+        chart_df = pd.DataFrame(
+            vision
+        )
+
+        chart_df = chart_df.sort_values(
+            "probability",
+            ascending=True
+        )
+
+        st.bar_chart(
+            chart_df.set_index(
+                "finding"
+            )[
+                "probability"
+            ]
+        )
+
+        # ====================================================
+        # EXPORT
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-label">Export</div>',
+            unsafe_allow_html=True
+        )
+
+        export_data = {
+            "project": (
+                "Multimodal Radiology Analysis"
+            ),
+            "timestamp": analysis[
+                "timestamp"
+            ],
+            "source": analysis[
+                "source"
+            ],
+            "vision_model": VISION_MODEL,
+            "nlp_model": NLP_MODEL,
+            "vision_findings": analysis[
+                "vision"
+            ],
+            "report_findings": analysis[
+                "report_findings"
+            ],
+            "cross_modal_comparison": analysis[
+                "comparison"
+            ],
+            "plain_language_summary": analysis[
+                "summary"
+            ],
+            "limitations": [
+                "Research prototype.",
+                "Not clinically validated.",
+                "Model scores are not calibrated clinical probabilities.",
+                "Radiology report remains the primary clinical source.",
+                "Agreement with a report is not equivalent to ground-truth accuracy.",
+            ],
+        }
+
+        st.download_button(
+            "Download structured analysis",
+            data=json.dumps(
+                export_data,
+                indent=2
+            ),
+            file_name="radiology_multimodal_analysis.json",
+            mime="application/json",
+            use_container_width=False,
         )
 
 
 # ============================================================
-# HISTORY PAGE
+# PAGE: CASE HISTORY
 # ============================================================
 
-elif page == "History":
+elif page == "Case History":
 
-    st.title(
-        "Study History"
+    st.markdown(
+        '<div class="app-kicker">Case management</div>',
+        unsafe_allow_html=True
     )
 
+    st.markdown(
+        '<div class="app-title">Case History</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="app-subtitle">
+            A session-level record of cases analyzed during the
+            current browser session. No persistent patient database
+            is implemented in this prototype.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     if not st.session_state.history:
 
         st.info(
-            "No analyses in this browser "
-            "session yet."
+            "No cases have been analyzed in this session."
         )
-
 
     else:
 
-        for result in (
+        history_df = pd.DataFrame(
             st.session_state.history
-        ):
+        )
 
-            with st.expander(
-                (
-                    f"{result['study_id']} — "
-                    f"{result['summary'][:100]}"
-                )
-            ):
+        history_df.columns = [
+            "Timestamp",
+            "X-ray",
+            "Report",
+            "Findings processed",
+        ]
 
-                st.write(
-                    result[
-                        "summary"
-                    ]
-                )
+        st.dataframe(
+            history_df,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-
-                st.download_button(
-                    "Download JSON",
-
-                    data=export_json(
-                        result
-                    ),
-
-                    file_name=(
-                        f"{result['study_id']}.json"
-                    ),
-
-                    mime="application/json",
-
-                    key=(
-                        "history_"
-                        + result[
-                            "study_id"
-                        ]
-                    ),
-                )
+    st.markdown(
+        """
+        <div class="disclaimer">
+        <strong>Privacy note.</strong>
+        The prototype does not implement persistent patient storage.
+        Do not upload identifiable clinical information to the public
+        deployment.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 
 # ============================================================
-# EVALUATION PAGE
+# PAGE: EVALUATION
 # ============================================================
 
 elif page == "Evaluation":
 
-    st.title(
-        "Evaluation"
+    st.markdown(
+        '<div class="app-kicker">Research evaluation</div>',
+        unsafe_allow_html=True
     )
 
-
-    st.write(
-        "This page deliberately avoids "
-        "claiming clinical accuracy from "
-        "agreement with a radiology report."
+    st.markdown(
+        '<div class="app-title">Evaluation Framework</div>',
+        unsafe_allow_html=True
     )
-
 
     st.markdown(
         """
-### Proper evaluation design
+        <div class="app-subtitle">
+            The evaluation layer separates model behavior,
+            report extraction and multimodal comparison instead
+            of treating report agreement as clinical accuracy.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-For a real research evaluation:
+    st.markdown(
+        "### 1. Image-model evaluation"
+    )
 
-1. Use an appropriately licensed,
-   de-identified dataset.
+    st.markdown(
+        """
+        The vision component produces independent scores for
+        multiple radiographic findings. Because this is a
+        multi-label classifier, the outputs do not form a
+        probability distribution that sums to 100 percent.
 
-2. Define the label ontology before testing.
+        Appropriate future evaluation would use an independently
+        annotated test set and report class-specific metrics such
+        as AUROC, sensitivity, specificity and calibration.
+        """
+    )
 
-3. Keep patient-level train/validation/test
-   separation.
+    st.markdown(
+        "### 2. Report extraction evaluation"
+    )
 
-4. Use an independent reference standard.
+    st.markdown(
+        """
+        The text-processing layer is evaluated conceptually along
+        three dimensions:
 
-5. Report AUROC, sensitivity, specificity,
-   and confidence intervals where appropriate.
+        - finding normalization
+        - negation detection
+        - uncertainty detection
 
-6. Evaluate uncertain and missing labels.
+        For example, "no pleural effusion" should not be converted
+        into a positive pleural-effusion finding.
+        """
+    )
 
-7. Perform subgroup analysis where the
-   dataset supports it.
+    st.markdown(
+        "### 3. Multimodal evaluation"
+    )
 
-The built-in demo is illustrative and
-is not a clinical benchmark.
-"""
+    st.markdown(
+        """
+        The comparison layer evaluates whether information from
+        the two modalities is compatible under explicit rules.
+
+        A report-model match should not automatically be described
+        as a correct prediction. A radiology report is a clinical
+        information source, not necessarily an independent
+        ground-truth annotation.
+        """
+    )
+
+    st.markdown(
+        "### 4. Reproducible testing protocol"
+    )
+
+    st.markdown(
+        """
+        A stronger future experiment would use paired,
+        de-identified radiographs and reports from a public
+        research dataset.
+
+        Each case can then be evaluated for:
+
+        1. image-model output
+        2. report finding extraction
+        3. negation handling
+        4. uncertainty handling
+        5. cross-modal relationship
+        6. human review of disagreements
+        """
+    )
+
+    st.markdown(
+        """
+        <div class="disclaimer">
+        This prototype does not claim clinical accuracy. No
+        performance number is presented here unless it has been
+        calculated on an explicitly defined, independently
+        evaluated dataset.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
 
 # ============================================================
-# MODELS & METHODOLOGY
+# PAGE: METHODOLOGY
 # ============================================================
 
-elif page == "Models & Methodology":
+elif page == "Methodology":
 
-    st.title("Models & Methodology")
-
-    st.subheader("Computer Vision")
-
-    st.write(
-        f"Model: {VISION_MODEL}"
+    st.markdown(
+        '<div class="app-kicker">System architecture</div>',
+        unsafe_allow_html=True
     )
 
-    st.write(
+    st.markdown(
+        '<div class="app-title">Methodology</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
         """
-The application uses a pretrained DenseNet-121
-chest-X-ray multi-label classifier hosted on
-Hugging Face.
-
-The model predicts 14 CheXpert-style labels.
-
-The application does not train the model.
-"""
+        <div class="app-subtitle">
+            The system is designed as a multimodal pipeline in
+            which image and language are processed independently
+            before their structured outputs are compared.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    st.subheader("Biomedical NLP")
-
-    st.write(
-        f"Model: {NLP_MODEL}"
+    st.markdown(
+        "### System pipeline"
     )
-
-    st.write(
-        """
-The report pipeline first applies
-radiology-specific normalization and
-local-context negation handling.
-
-The biomedical NER model is used as a
-fallback when the supported radiology
-vocabulary does not identify a finding.
-"""
-    )
-
-    st.subheader("Multimodal Fusion")
 
     st.code(
         """
 Chest X-ray
-     |
-     v
-DenseNet-121
-     |
-     v
-Image findings
-     |
-     +------------------+
-                        |
-                        v
-                  Normalization
-                        ^
-                        |
-                        |
-Radiology report       |
-     |                 |
-     v                 |
-Report NLP ------------+
-     |
-     v
-Report findings
-     |
-     v
-Image <-> Report comparison
-     |
-     v
-Plain-language explanation
-""",
+    |
+    v
+Image preprocessing
+    |
+    v
+DenseNet-121 chest X-ray classifier
+    |
+    v
+14 multi-label radiographic scores
+    |
+    +-----------------------------+
+                                  |
+                                  v
+                        Finding normalization
+                                  ^
+                                  |
+Radiology report                 |
+    |                             |
+    v                             |
+PDF/TXT extraction                |
+    |                             |
+    v                             |
+Clinical terminology detection ---+
+    |
+    v
+Negation and uncertainty analysis
+    |
+    v
+Structured report findings
+    |
+    +-------------+---------------+
+                  |
+                  v
+        Cross-modal comparison
+                  |
+                  v
+        Plain-language explanation
+                  |
+                  v
+        Structured JSON export
+        """,
         language="text",
     )
 
-    st.subheader("Important Limitations")
+    st.markdown(
+        "### Image processing"
+    )
 
     st.markdown(
         """
-- The model is not clinically validated by this application.
-- Model probabilities are not clinical certainty.
-- The 0.5 threshold is an engineering display threshold.
-- Report negation handling is intentionally lightweight.
-- Agreement with a report is not a ground-truth accuracy measure.
-- The application is not intended for medical decision-making.
-"""
+        The radiograph is converted to RGB and resized to the
+        model input resolution. ImageNet normalization is applied
+        before inference. The pretrained DenseNet-121 model produces
+        independent sigmoid outputs for the supported chest
+        radiographic categories.
+        """
+    )
+
+    st.markdown(
+        "### Clinical text processing"
+    )
+
+    st.markdown(
+        """
+        The report is first converted into plain text. A normalized
+        terminology layer maps common expressions to canonical
+        findings. Local context is then examined for negation and
+        uncertainty.
+
+        For example:
+
+        "No pleural effusion"
+
+        becomes:
+
+        Finding: Pleural Effusion  
+        Status: NEGATED
+
+        rather than a positive finding.
+        """
+    )
+
+    st.markdown(
+        "### Multimodal fusion"
+    )
+
+    st.markdown(
+        """
+        The system does not concatenate image pixels and text
+        embeddings into a single black-box model. Instead, it uses
+        structured intermediate representations.
+
+        This design makes the reasoning process inspectable:
+
+        image → finding scores
+
+        report → normalized findings + evidence
+
+        findings → cross-modal relationship
+
+        This is particularly useful for a research prototype
+        because each stage can be independently inspected and
+        evaluated.
+        """
+    )
+
+    st.markdown(
+        "### Technology stack"
+    )
+
+    stack_df = pd.DataFrame(
+        [
+            ["Python", "Application and analysis pipeline"],
+            ["Streamlit", "Interactive research interface"],
+            ["PyTorch", "Neural-network inference"],
+            ["Torchvision", "DenseNet-121 architecture"],
+            ["Hugging Face Hub", "Pretrained model distribution"],
+            ["Transformers", "Biomedical NLP"],
+            ["PyMuPDF", "PDF text extraction"],
+            ["Pillow", "Image processing"],
+            ["Pandas", "Structured analysis"],
+            ["Plotly / Streamlit charts", "Visualization"],
+        ],
+        columns=[
+            "Technology",
+            "Role",
+        ],
+    )
+
+    st.dataframe(
+        stack_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# PAGE: MODELS
+# ============================================================
+
+elif page == "Models":
+
+    st.markdown(
+        '<div class="app-kicker">Machine learning components</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="app-title">Models</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="app-subtitle">
+            The prototype combines a pretrained radiographic
+            classifier with biomedical language processing.
+            No model is trained inside the application.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        "### Vision model"
+    )
+
+    st.markdown(
+        f"""
+        **Model:** `{VISION_MODEL}`
+
+        **Architecture:** DenseNet-121
+
+        **Task:** Multi-label chest X-ray classification
+
+        **Outputs:** 14 radiographic categories
+
+        The model produces independent sigmoid scores for each
+        category. These values are presented as model scores rather
+        than clinical probabilities.
+        """
+    )
+
+    st.markdown(
+        "### NLP model"
+    )
+
+    st.markdown(
+        f"""
+        **Model:** `{NLP_MODEL}`
+
+        The NLP component is used as a supplementary biomedical
+        entity-recognition layer. The primary report interpretation
+        remains based on a transparent normalized finding dictionary
+        with explicit handling of negation and uncertainty.
+        """
+    )
+
+    st.markdown(
+        "### Why pretrained models?"
+    )
+
+    st.markdown(
+        """
+        Training a clinically meaningful radiology model from
+        scratch would require a substantially larger dataset,
+        expert annotations, compute resources and formal validation.
+
+        This project therefore focuses on system design:
+        integrating pretrained models, clinical text processing,
+        structured representations and multimodal comparison into
+        one inspectable application.
+        """
+    )
+
+    st.markdown(
+        "### Model interpretation"
+    )
+
+    st.markdown(
+        """
+        A model score represents the output of a particular
+        pretrained classifier under its training distribution.
+        It should not be interpreted as a statement that a disease
+        is present with that exact probability.
+
+        The application therefore deliberately avoids converting
+        model scores into diagnostic statements.
+        """
+    )
+
+
+# ============================================================
+# PAGE: LIMITATIONS
+# ============================================================
+
+elif page == "Limitations":
+
+    st.markdown(
+        '<div class="app-kicker">Responsible research</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="app-title">Limitations</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="app-subtitle">
+            Understanding what the system cannot establish is part
+            of the design of a responsible medical AI prototype.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    limitations = [
+        (
+            "Not clinically validated",
+            "The application has not undergone clinical validation, regulatory review or prospective testing."
+        ),
+        (
+            "Model scores are not diagnoses",
+            "The vision model produces research-model scores. These should not be interpreted as confirmed clinical findings."
+        ),
+        (
+            "Report agreement is not ground truth",
+            "A model agreeing with a radiology report does not independently establish model correctness."
+        ),
+        (
+            "Dataset shift",
+            "Performance can change across hospitals, scanners, populations, acquisition protocols and disease prevalence."
+        ),
+        (
+            "Text extraction limitations",
+            "Simple terminology and context rules cannot represent every form of clinical language."
+        ),
+        (
+            "No treatment recommendations",
+            "The system intentionally does not recommend medication, treatment or clinical management."
+        ),
+        (
+            "No persistent patient database",
+            "The prototype stores case history only within the current session."
+        ),
+        (
+            "Public deployment",
+            "Users should not upload identifiable patient information to a public research deployment."
+        ),
+    ]
+
+    for title, description in limitations:
+
+        st.markdown(
+            f"""
+            <div class="surface">
+
+                <h3 style="margin-top:0;">
+                    {title}
+                </h3>
+
+                <div class="small-note">
+                    {description}
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# PAGE: ABOUT
+# ============================================================
+
+elif page == "About":
+
+    st.markdown(
+        '<div class="app-kicker">Project overview</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="app-title">About the Project</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="app-subtitle">
+            An independent exploration of multimodal machine
+            learning for medical information interpretation.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        "### Research motivation"
+    )
+
+    st.markdown(
+        """
+        Radiology examinations generate more than one source of
+        information. The image contains visual evidence, while the
+        accompanying report contains a clinician's textual
+        interpretation.
+
+        This project explores whether these two modalities can be
+        represented independently and then compared in a transparent
+        computational pipeline.
+        """
+    )
+
+    st.markdown(
+        "### Research question"
+    )
+
+    st.markdown(
+        """
+        Can a lightweight multimodal system combine pretrained
+        chest-radiograph analysis with structured clinical-text
+        processing to make relationships between image-model
+        outputs and report findings easier to inspect?
+        """
+    )
+
+    st.markdown(
+        "### What makes the prototype multimodal?"
+    )
+
+    st.markdown(
+        """
+        The system does not simply pass a radiology report to an
+        LLM or classify an image in isolation.
+
+        It creates two structured representations:
+
+        **Visual representation**
+
+        Chest X-ray → pretrained vision model → radiographic scores
+
+        **Language representation**
+
+        Radiology report → terminology normalization →
+        negation/uncertainty detection → structured findings
+
+        These representations are then compared at the finding
+        level.
+        """
+    )
+
+    st.markdown(
+        "### Project scope"
+    )
+
+    scope_df = pd.DataFrame(
+        [
+            ["Computer Vision", "Chest X-ray classification"],
+            ["Natural Language Processing", "Radiology finding extraction"],
+            ["Multimodal AI", "Image-report comparison"],
+            ["Data Engineering", "PDF/TXT parsing and normalization"],
+            ["Visualization", "Structured findings and model profiles"],
+            ["Software Engineering", "Interactive deployed application"],
+            ["Responsible AI", "Explicit limitations and uncertainty"],
+        ],
+        columns=[
+            "Area",
+            "Contribution",
+        ],
+    )
+
+    st.dataframe(
+        scope_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown(
+        """
+        <div class="disclaimer">
+        <strong>Project status.</strong>
+        This is an independent educational and research prototype.
+        It is not a medical device, diagnostic system or substitute
+        for professional radiological interpretation.
+        </div>
+        """,
+        unsafe_allow_html=True
     )
