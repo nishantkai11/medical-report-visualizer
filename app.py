@@ -2479,71 +2479,89 @@ is not a clinical benchmark.
 
 elif page == "Models & Methodology":
 
-    st.title(
-        "Models & Methodology"
+    st.title("Models & Methodology")
+
+    st.subheader("Computer Vision")
+
+    st.write(
+        f"Model: {VISION_MODEL}"
     )
 
+    st.write(
+        """
+The application uses a pretrained DenseNet-121
+chest-X-ray multi-label classifier hosted on
+Hugging Face.
 
-    st.markdown(
-        f"""
-### Computer vision
+The model predicts 14 CheXpert-style labels.
 
-**Model:**
-`{VISION_MODEL}`
+The application does not train the model.
+"""
+    )
 
-The application uses a pretrained
-DenseNet-121 chest-X-ray multi-label
-classifier hosted on Hugging Face.
+    st.subheader("Biomedical NLP")
 
-The model predicts 14 CheXpert-style
-labels.
+    st.write(
+        f"Model: {NLP_MODEL}"
+    )
 
-The application does not train the
-model.
-
-### Biomedical NLP
-
-**Model:**
-`{NLP_MODEL}`
-
+    st.write(
+        """
 The report pipeline first applies
 radiology-specific normalization and
 local-context negation handling.
 
-The biomedical NER model is used only
-as a fallback when the supported
-radiology vocabulary does not identify
-a finding.
+The biomedical NER model is used as a
+fallback when the supported radiology
+vocabulary does not identify a finding.
+"""
+    )
 
-### Multimodal fusion
+    st.subheader("Multimodal Fusion")
 
-```text
+    st.code(
+        """
 Chest X-ray
-      |
-      v
+     |
+     v
 DenseNet-121
-      |
-      v
+     |
+     v
 Image findings
-      |
-      |
-      +----------------------+
-                             |
-                             v
-                      Normalization
-                             ^
-                             |
-                             |
-Radiology report             |
-      |                      |
-      v                      |
-Report NLP ------------------+
-      |
-      v
+     |
+     +------------------+
+                        |
+                        v
+                  Normalization
+                        ^
+                        |
+                        |
+Radiology report       |
+     |                 |
+     v                 |
+Report NLP ------------+
+     |
+     v
 Report findings
-      |
-      v
-Image ↔ Report comparison
-      |
-      v
+     |
+     v
+Image <-> Report comparison
+     |
+     v
 Plain-language explanation
+""",
+        language="text",
+    )
+
+    st.subheader("Important Limitations")
+
+    st.markdown(
+        """
+- The model is not clinically validated by this application.
+- Model probabilities are not clinical certainty.
+- The 0.5 threshold is an engineering display threshold.
+- Report negation handling is intentionally lightweight.
+- Agreement with a report is not a ground-truth accuracy measure.
+- The application is not intended for medical decision-making.
+"""
+    )
