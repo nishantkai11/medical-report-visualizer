@@ -1,754 +1,2549 @@
-# Multimodal Medical Report Visualizer
-# Single-file deployment build for Streamlit Community Cloud.
-
-import os
-from typing import Any
-
-import numpy as np
-from PIL import Image
-
-LABELS = [
-    "atelectasis", "cardiomegaly", "consolidation", "edema",
-    "effusion", "emphysema", "fibrosis", "hernia",
-    "infiltration", "mass", "nodule", "pleural_thickening",
-    "pneumonia", "pneumothorax"
-]
-
-_PIPELINE = None
-
-def _load_pipeline():
-    global _PIPELINE
-    if _PIPELINE is not None:
-        return _PIPELINE
-    try:
-        from transformers import pipeline
-        model = os.getenv("VISION_MODEL", "itsomk/chexpert-densenet121")
-        _PIPELINE = pipeline("image-classification", model=model)
-        return _PIPELINE
-    except Exception:
-        return None
-
-def analyze_image(image_file: Any):
-    image_file.seek(0)
-    image = Image.open(image_file).convert("RGB")
-
-    pipe = _load_pipeline()
-    if pipe is None:
-        # Safe fallback: make the application usable while clearly marking the output.
-        return [
-            {
-                "name": "model_unavailable",
-                "probability": 0.0,
-                "status": "unavailable",
-                "explanation": (
-                    "The live Hugging Face vision model could not be loaded. "
-                    "Configure HF_TOKEN/model access and restart the app."
-                ),
-                "source": "vision"
-            }
-        ]
-
-    outputs = pipe(image)
-    findings = []
-    for item in outputs:
-        label = str(item.get("label", "")).lower().replace(" ", "_")
-        score = float(item.get("score", 0.0))
-        findings.append({
-            "name": label,
-            "probability": score,
-            "status": "elevated" if score >= 0.5 else "low",
-            "explanation": "Pretrained chest-X-ray model output; not a diagnosis.",
-            "source": "vision"
-        })
-    return sorted(findings, key=lambda x: x["probability"], reverse=True)[:8]
-
-import re
-import os
-
-COMMON = {
-    "opacity": ("present", "An area that looks different from surrounding lung tissue on the X-ray."),
-    "airspace opacity": ("present", "An area of the lung appears different from surrounding lung tissue."),
-    "pleural effusion": ("present", "Extra fluid around the lung."),
-    "cardiomegaly": ("present", "The heart appears larger than usual."),
-    "pneumothorax": ("present", "Air is present in the space around the lung."),
-    "consolidation": ("present", "An area of lung appears filled or denser than usual."),
-    "edema": ("present", "Fluid-related changes in the lungs."),
-}
-
-def _status_for(text: str, term: str) -> str:
-    lower = text.lower()
-    patterns = [
-        f"no {term}",
-        f"without {term}",
-        f"negative for {term}",
-        f"absence of {term}",
-    ]
-    return "absent" if any(p in lower for p in patterns) else "present"
-
-def extract_findings(report_text: str):
-    text = " ".join(report_text.split())
-    findings = []
-    lower = text.lower()
-
-    for term, (default_status, explanation) in COMMON.items():
-        if term in lower:
-            status = _status_for(lower, term)
-            location = None
-            if "right lower" in lower and term in lower:
-                location = "right lower lung"
-            evidence_match = re.search(r"[^.]{0,80}" + re.escape(term) + r"[^.]{0,100}", lower)
-            evidence = evidence_match.group(0).strip() if evidence_match else term
-            findings.append({
-                "name": term.replace(" ", "_"),
-                "status": status,
-                "location": location,
-                "evidence": evidence,
-                "plain_language": explanation,
-            })
-
-    if not findings:
-        try:
-            from transformers import pipeline
-            model = os.getenv("NLP_MODEL", "d4data/biomedical-ner-all")
-            ner = pipeline("token-classification", model=model, aggregation_strategy="simple")
-            entities = ner(text[:4000])
-            for entity in entities[:20]:
-                word = entity.get("word", "").strip()
-                if word:
-                    findings.append({
-                        "name": word.lower().replace(" ", "_"),
-                        "status": "uncertain",
-                        "location": None,
-                        "evidence": word,
-                        "plain_language": "A biomedical term identified in the report."
-                    })
-        except Exception:
-            pass
-
-    return findings or [{
-        "name": "no_normalized_findings",
-        "status": "uncertain",
-        "location": None,
-        "evidence": "No supported finding pattern was identified.",
-        "plain_language": "The prototype could not normalize a specific finding from this report."
-    }]
-
-def compare_findings(vision, report):
-    report_map = {r["name"]: r for r in report}
-    comparisons = []
-
-    for v in vision:
-        name = v["name"]
-        if name == "model_unavailable":
-            continue
-        prob = float(v.get("probability", 0.0))
-        image_positive = prob >= 0.5
-
-        if name not in report_map:
-            comparisons.append({
-                "finding": name,
-                "image": f"{prob:.0%}",
-                "image_probability": prob,
-                "report": "not_mentioned",
-                "relationship": "not_mentioned",
-            })
-            continue
-
-        r = report_map[name]
-        report_status = r.get("status", "uncertain")
-
-        if report_status == "uncertain":
-            relationship = "uncertain"
-        elif (image_positive and report_status == "present") or (
-            not image_positive and report_status == "absent"
-        ):
-            relationship = "consistent"
-        else:
-            relationship = "potential_difference"
-
-        comparisons.append({
-            "finding": name,
-            "image": f"{prob:.0%}",
-            "image_probability": prob,
-            "report": report_status,
-            "relationship": relationship,
-        })
-
-    return comparisons
-
-import os
-
-def generate_explanation(structured):
-    api_key = os.getenv("LLM_API_KEY")
-    if not api_key:
-        return _deterministic_summary(structured)
-
-    # Provider-agnostic placeholder: configure a supported provider here.
-    # Keeping this isolated makes the rest of the application provider-independent.
-    try:
-        provider = os.getenv("LLM_PROVIDER", "").lower()
-        if provider == "openai":
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-            prompt = f"""
-You are explaining a radiology analysis for a general audience.
-The clinician report is the primary clinical source. AI vision outputs
-are predictions, not diagnoses.
-
-Structured information:
-{structured}
-
-Write a concise explanation in plain language. Do not invent findings,
-give treatment advice, or override the report. Clearly distinguish
-report findings from AI observations.
-"""
-            response = client.chat.completions.create(
-                model=os.getenv("LLM_MODEL", "gpt-5-mini"),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-            )
-            return response.choices[0].message.content.strip()
-    except Exception:
-        pass
-
-    return _deterministic_summary(structured)
-
-def _deterministic_summary(structured):
-    report = structured.get("report_findings", [])
-    comparisons = structured.get("comparisons", [])
-
-    present = [
-        r["name"].replace("_", " ")
-        for r in report if r.get("status") == "present"
-    ]
-    absent = [
-        r["name"].replace("_", " ")
-        for r in report if r.get("status") == "absent"
-    ]
-    consistent = [
-        c["finding"].replace("_", " ")
-        for c in comparisons if c["relationship"] == "consistent"
-    ]
-
-    parts = []
-    if present:
-        parts.append("The written report describes: " + ", ".join(present) + ".")
-    if absent:
-        parts.append("The report specifically describes as absent: " + ", ".join(absent) + ".")
-    if consistent:
-        parts.append(
-            "The prototype's image-model outputs are consistent with the written "
-            "report for: " + ", ".join(consistent) + "."
-        )
-    if not parts:
-        parts.append(
-            "The prototype could not generate a detailed plain-language summary "
-            "from the supplied information."
-        )
-
-    parts.append(
-        "This is an AI-assisted explanation for educational use. "
-        "It is not a medical diagnosis and should not be used for treatment decisions."
-    )
-    return " ".join(parts)
-
-import uuid
-
-def get_demo_case():
-    study_id = "DEMO-" + uuid.uuid4().hex[:6].upper()
-    vision = [
-        {"name": "opacity", "probability": 0.78, "status": "elevated",
-         "explanation": "The pretrained image model assigned a relatively high probability to an opacity-related finding.", "source": "vision"},
-        {"name": "pleural_effusion", "probability": 0.10, "status": "low",
-         "explanation": "The pretrained image model assigned a low probability to pleural effusion.", "source": "vision"},
-        {"name": "cardiomegaly", "probability": 0.21, "status": "low",
-         "explanation": "The pretrained image model assigned a low-to-moderate probability to cardiomegaly.", "source": "vision"},
-    ]
-    report = [
-        {"name": "opacity", "status": "present", "location": "right lower lung",
-         "evidence": "Patchy right lower lobe airspace opacity is described."},
-        {"name": "pleural_effusion", "status": "absent", "location": None,
-         "evidence": "No pleural effusion is described."},
-    ]
-    comparisons = [
-        {"finding": "opacity", "image": "78%", "image_probability": 0.78,
-         "report": "present", "relationship": "consistent"},
-        {"finding": "pleural_effusion", "image": "10%", "image_probability": 0.10,
-         "report": "absent", "relationship": "consistent"},
-        {"finding": "cardiomegaly", "image": "21%", "image_probability": 0.21,
-         "report": "not_mentioned", "relationship": "not_mentioned"},
-    ]
-    return {
-        "result": {
-            "study_id": study_id,
-            "demo": True,
-            "summary": (
-                "The example report describes an area of opacity in the lower part "
-                "of the right lung and does not describe fluid around the lungs. "
-                "The example image-model outputs are broadly consistent with those "
-                "documented findings. These values are illustrative and are not a diagnosis."
-            ),
-            "vision_findings": vision,
-            "report_findings": report,
-            "comparisons": comparisons,
-            "medical_terms": [
-                {"term": "Opacity", "plain_language": "An area that looks different from surrounding lung tissue on the X-ray."},
-                {"term": "Pleural effusion", "plain_language": "Extra fluid around the lung."},
-                {"term": "Cardiomegaly", "plain_language": "The heart appears larger than usual."},
-            ],
-            "limitations": [
-                "Demo output is illustrative.",
-                "Model probabilities are not clinical certainty.",
-                "This project is not clinically validated."
-            ],
-            "models": {
-                "vision": "itsomk/chexpert-densenet121",
-                "nlp": "d4data/biomedical-ner-all",
-                "explanation": "Configurable LLM API"
-            }
-        }
-    }
-
-def extract_pdf_text(uploaded_file):
-    try:
-        import fitz
-        data = uploaded_file.read()
-        doc = fitz.open(stream=data, filetype="pdf")
-        return "\n".join(page.get_text() for page in doc).strip()
-    except Exception:
-        return ""
-
-import os
-import uuid
-from typing import Any
-
-
-def analyze_case(image_file: Any, report_text: str) -> dict:
-    study_id = "STUDY-" + uuid.uuid4().hex[:8].upper()
-    vision = analyze_image(image_file)
-    report = extract_findings(report_text)
-    comparisons = compare_findings(vision, report)
-
-    structured = {
-        "study_id": study_id,
-        "vision_findings": vision,
-        "report_findings": report,
-        "comparisons": comparisons,
-    }
-
-    summary = generate_explanation(structured)
-
-    terms = []
-    seen = set()
-    for item in report:
-        name = item["name"].replace("_", " ").title()
-        if name not in seen:
-            seen.add(name)
-            terms.append({
-                "term": name,
-                "plain_language": item.get(
-                    "plain_language",
-                    "A medical finding described in the radiology report."
-                )
-            })
-
-    return {
-        **structured,
-        "demo": False,
-        "summary": summary,
-        "medical_terms": terms,
-        "limitations": [
-            "AI observations are not diagnoses.",
-            "The clinician/radiology report is the primary clinical source.",
-            "This prototype has not undergone clinical validation."
-        ],
-        "models": {
-            "vision": os.getenv("VISION_MODEL", "itsomk/chexpert-densenet121"),
-            "nlp": os.getenv("NLP_MODEL", "d4data/biomedical-ner-all"),
-            "explanation": os.getenv("LLM_MODEL", "configurable")
-        }
-    }
-
+import io
 import json
-from pathlib import Path
+import os
+import re
+import uuid
 
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="Multimodal Medical Report Visualizer",
     page_icon="🩻",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# ---------- Styling ----------
-st.markdown("""
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+VISION_MODEL = os.getenv(
+    "VISION_MODEL",
+    "itsomk/chexpert-densenet121",
+)
+
+NLP_MODEL = os.getenv(
+    "NLP_MODEL",
+    "d4data/biomedical-ner-all",
+)
+
+
+# ============================================================
+# CHEXPERT LABELS
+# ============================================================
+
+CHEXPERT_LABELS = [
+    "No Finding",
+    "Enlarged Cardiomediastinum",
+    "Cardiomegaly",
+    "Lung Opacity",
+    "Lung Lesion",
+    "Edema",
+    "Consolidation",
+    "Pneumonia",
+    "Atelectasis",
+    "Pneumothorax",
+    "Pleural Effusion",
+    "Pleural Other",
+    "Fracture",
+    "Support Devices",
+]
+
+
+VISION_TO_CANONICAL = {
+    "no finding": "no_finding",
+    "enlarged cardiomediastinum": "enlarged_cardiomediastinum",
+    "cardiomegaly": "cardiomegaly",
+    "lung opacity": "lung_opacity",
+    "lung lesion": "lung_lesion",
+    "edema": "edema",
+    "consolidation": "consolidation",
+    "pneumonia": "pneumonia",
+    "atelectasis": "atelectasis",
+    "pneumothorax": "pneumothorax",
+    "pleural effusion": "pleural_effusion",
+    "pleural other": "pleural_other",
+    "fracture": "fracture",
+    "support devices": "support_devices",
+}
+
+
+# ============================================================
+# RADIOLOGY VOCABULARY
+# ============================================================
+
+REPORT_TERMS = {
+
+    "lung opacity": (
+        "lung_opacity",
+        "An area of the lung looks different or denser "
+        "than surrounding lung tissue.",
+    ),
+
+    "airspace opacity": (
+        "lung_opacity",
+        "An area of the lung appears denser "
+        "than surrounding lung tissue.",
+    ),
+
+    "opacity": (
+        "lung_opacity",
+        "An area that looks different from surrounding "
+        "lung tissue.",
+    ),
+
+    "cardiomegaly": (
+        "cardiomegaly",
+        "The heart appears larger than usual.",
+    ),
+
+    "pleural effusion": (
+        "pleural_effusion",
+        "Extra fluid is described around the lung.",
+    ),
+
+    "pneumothorax": (
+        "pneumothorax",
+        "Air is described in the space around the lung.",
+    ),
+
+    "consolidation": (
+        "consolidation",
+        "An area of lung is described as abnormally dense.",
+    ),
+
+    "pneumonia": (
+        "pneumonia",
+        "The report uses the term pneumonia.",
+    ),
+
+    "atelectasis": (
+        "atelectasis",
+        "Part of the lung is described as partially "
+        "collapsed or under-expanded.",
+    ),
+
+    "edema": (
+        "edema",
+        "The report describes fluid-related changes.",
+    ),
+
+    "lung lesion": (
+        "lung_lesion",
+        "A focal abnormality in the lung is described.",
+    ),
+
+    "pleural other": (
+        "pleural_other",
+        "Another abnormality involving the pleural "
+        "space is described.",
+    ),
+
+    "fracture": (
+        "fracture",
+        "A fracture is described.",
+    ),
+
+    "support device": (
+        "support_devices",
+        "A medical support device is described.",
+    ),
+}
+
+
+NEGATION_PATTERNS = [
+    r"\bno\b",
+    r"\bwithout\b",
+    r"\bnegative for\b",
+    r"\babsence of\b",
+    r"\bfree of\b",
+    r"\bnot seen\b",
+    r"\bnot identified\b",
+    r"\bno evidence of\b",
+]
+
+
+UNCERTAINTY_PATTERNS = [
+    r"\bpossible\b",
+    r"\bpossibly\b",
+    r"\bmay represent\b",
+    r"\bcannot exclude\b",
+    r"\bsuspicious for\b",
+    r"\bquestion of\b",
+    r"\bconcerning for\b",
+]
+
+
+# ============================================================
+# CUSTOM CSS
+# ============================================================
+
+st.markdown(
+    """
 <style>
-.block-container {max-width: 1400px; padding-top: 2rem; padding-bottom: 3rem;}
-.hero {padding: 1.4rem 1.6rem; border: 1px solid rgba(128,128,128,.22);
-       border-radius: 18px; background: linear-gradient(135deg, rgba(37,99,235,.10), rgba(14,165,233,.05));}
-.small-muted {color: #6b7280; font-size: .9rem;}
-.metric-card {padding: 1rem; border: 1px solid rgba(128,128,128,.20);
-              border-radius: 14px; background: rgba(128,128,128,.04);}
-.status-good {color: #15803d; font-weight: 700;}
-.status-warn {color: #b45309; font-weight: 700;}
-.status-info {color: #2563eb; font-weight: 700;}
-.disclaimer {padding: 1rem; border-radius: 12px; background: rgba(245,158,11,.10);
-             border: 1px solid rgba(245,158,11,.25);}
+
+.block-container {
+    max-width: 1450px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+
+.hero {
+    padding: 1.7rem 1.8rem;
+    border: 1px solid rgba(128,128,128,.22);
+    border-radius: 20px;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(37,99,235,.10),
+            rgba(14,165,233,.05)
+        );
+}
+
+.muted {
+    color: #6b7280;
+}
+
+.disclaimer {
+    padding: 1rem 1.1rem;
+    border-radius: 14px;
+    background: rgba(245,158,11,.10);
+    border: 1px solid rgba(245,158,11,.25);
+}
+
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ---------- Helpers ----------
-def render_finding_card(f):
-    name = f.get("name", "Unknown finding").replace("_", " ").title()
-    prob = f.get("probability")
-    status = f.get("status", "unknown").replace("_", " ").title()
-    explanation = f.get("explanation", "")
-    location = f.get("location")
-    source = f.get("source", "")
 
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown(f"### {name}")
-            st.caption(f"{source.title()} model" if source else "")
-        with c2:
-            if prob is not None:
-                st.metric("Probability", f"{prob:.0%}")
-            else:
-                st.metric("Status", status)
-        if prob is not None:
-            st.progress(max(0.0, min(1.0, float(prob))))
-        st.write(explanation)
-        if location:
-            st.caption(f"Location: {location}")
+# ============================================================
+# VISION MODEL
+# ============================================================
 
-def make_export(result):
-    payload = {
-        "study_id": result["study_id"],
-        "summary": result["summary"],
-        "vision_findings": result["vision_findings"],
-        "report_findings": result["report_findings"],
-        "comparisons": result["comparisons"],
-        "medical_terms": result["medical_terms"],
-        "limitations": result["limitations"],
-        "models": result["models"],
+@st.cache_resource(show_spinner=False)
+def load_vision_model():
+
+    """
+    Loads the actual CheXpert DenseNet-121 checkpoint.
+
+    The Hugging Face repository contains a PyTorch/
+    torchvision DenseNet-121 checkpoint stored as
+    pytorch_model.safetensors.
+
+    Therefore we load it directly instead of using
+    transformers.pipeline().
+    """
+
+    import torch
+
+    from torchvision import models, transforms
+
+    from safetensors.torch import load_file
+
+    from huggingface_hub import hf_hub_download
+
+
+    class DenseNet121CheXpert(torch.nn.Module):
+
+        def __init__(self, num_labels=14):
+
+            super().__init__()
+
+            self.densenet = models.densenet121(
+                weights=None
+            )
+
+            num_features = (
+                self.densenet.classifier.in_features
+            )
+
+            self.densenet.classifier = torch.nn.Linear(
+                num_features,
+                num_labels,
+            )
+
+        def forward(self, x):
+
+            return self.densenet(x)
+
+
+    # --------------------------------------------------------
+    # Download checkpoint from Hugging Face
+    # --------------------------------------------------------
+
+    checkpoint_path = hf_hub_download(
+        repo_id=VISION_MODEL,
+        filename="pytorch_model.safetensors",
+    )
+
+
+    # --------------------------------------------------------
+    # Create model architecture
+    # --------------------------------------------------------
+
+    model = DenseNet121CheXpert(
+        num_labels=14
+    )
+
+
+    # --------------------------------------------------------
+    # Load safetensors checkpoint
+    # --------------------------------------------------------
+
+    state_dict = load_file(
+        checkpoint_path
+    )
+
+
+    missing_keys, unexpected_keys = (
+        model.load_state_dict(
+            state_dict,
+            strict=False,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Safety check
+    # --------------------------------------------------------
+
+    if len(state_dict) < 100:
+
+        raise RuntimeError(
+            "The CheXpert checkpoint did not load "
+            "correctly. The downloaded checkpoint "
+            "contains unexpectedly few parameters."
+        )
+
+
+    model.eval()
+
+
+    # --------------------------------------------------------
+    # Image preprocessing
+    # --------------------------------------------------------
+
+    preprocess = transforms.Compose(
+        [
+
+            transforms.Resize(
+                (224, 224)
+            ),
+
+            transforms.ToTensor(),
+
+            transforms.Normalize(
+                mean=[
+                    0.485,
+                    0.456,
+                    0.406,
+                ],
+
+                std=[
+                    0.229,
+                    0.224,
+                    0.225,
+                ],
+            ),
+        ]
+    )
+
+
+    return (
+        model,
+        preprocess,
+        torch,
+    )
+
+
+# ============================================================
+# X-RAY INFERENCE
+# ============================================================
+
+def analyze_xray(
+    image_bytes
+):
+
+    """
+    Runs real multi-label inference on
+    the uploaded chest X-ray.
+    """
+
+    image = Image.open(
+        io.BytesIO(image_bytes)
+    ).convert("RGB")
+
+
+    model, preprocess, torch = (
+        load_vision_model()
+    )
+
+
+    tensor = preprocess(
+        image
+    ).unsqueeze(0)
+
+
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
+
+    with torch.inference_mode():
+
+        logits = model(
+            tensor
+        )
+
+        probabilities = (
+            torch.sigmoid(
+                logits
+            )
+            .squeeze(0)
+            .tolist()
+        )
+
+
+    findings = []
+
+
+    for label, probability in zip(
+        CHEXPERT_LABELS,
+        probabilities,
+    ):
+
+        canonical_name = (
+            VISION_TO_CANONICAL[
+                label.lower()
+            ]
+        )
+
+
+        probability = float(
+            probability
+        )
+
+
+        findings.append(
+            {
+
+                "name":
+                    canonical_name,
+
+                "display_name":
+                    label,
+
+                "probability":
+                    probability,
+
+                "status":
+                    (
+                        "elevated"
+                        if probability >= 0.5
+                        else "low"
+                    ),
+
+                "source":
+                    "Hugging Face CheXpert DenseNet-121",
+
+                "explanation":
+                    (
+                        "Pretrained chest-X-ray "
+                        "model output. This probability "
+                        "is not a clinical diagnosis."
+                    ),
+            }
+        )
+
+
+    findings.sort(
+        key=lambda item:
+            item["probability"],
+        reverse=True,
+    )
+
+
+    return findings
+
+
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
+
+def extract_pdf_text(
+    file_bytes
+):
+
+    try:
+
+        import fitz
+
+
+        document = fitz.open(
+            stream=file_bytes,
+            filetype="pdf",
+        )
+
+
+        pages = []
+
+
+        for page in document:
+
+            pages.append(
+                page.get_text()
+            )
+
+
+        return "\n".join(
+            pages
+        ).strip()
+
+
+    except Exception:
+
+        return ""
+
+
+# ============================================================
+# REPORT FILE READING
+# ============================================================
+
+def read_report(
+    uploaded_file
+):
+
+    if uploaded_file is None:
+
+        return ""
+
+
+    file_bytes = (
+        uploaded_file.getvalue()
+    )
+
+
+    filename = (
+        uploaded_file.name.lower()
+    )
+
+
+    if filename.endswith(
+        ".pdf"
+    ):
+
+        return extract_pdf_text(
+            file_bytes
+        )
+
+
+    return file_bytes.decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+
+# ============================================================
+# REPORT NLP
+# ============================================================
+
+def extract_report_findings(
+    report_text
+):
+
+    text = " ".join(
+        report_text.split()
+    )
+
+    lower_text = text.lower()
+
+
+    findings = []
+
+
+    for term, (
+        canonical_name,
+        plain_language,
+    ) in REPORT_TERMS.items():
+
+
+        matches = list(
+            re.finditer(
+                re.escape(term),
+                lower_text,
+            )
+        )
+
+
+        if not matches:
+
+            continue
+
+
+        match = matches[0]
+
+
+        start = max(
+            0,
+            match.start() - 100,
+        )
+
+
+        end = min(
+            len(lower_text),
+            match.end() + 140,
+        )
+
+
+        context = (
+            lower_text[
+                start:end
+            ]
+        )
+
+
+        # ----------------------------------------------------
+        # Negation detection
+        # ----------------------------------------------------
+
+        negated = any(
+            re.search(
+                pattern,
+                context,
+            )
+            for pattern
+            in NEGATION_PATTERNS
+        )
+
+
+        # ----------------------------------------------------
+        # Uncertainty detection
+        # ----------------------------------------------------
+
+        uncertain = any(
+            re.search(
+                pattern,
+                context,
+            )
+            for pattern
+            in UNCERTAINTY_PATTERNS
+        )
+
+
+        if negated:
+
+            status = "absent"
+
+        elif uncertain:
+
+            status = "uncertain"
+
+        else:
+
+            status = "present"
+
+
+        evidence = (
+            text[
+                start:end
+            ].strip()
+        )
+
+
+        # ----------------------------------------------------
+        # Basic anatomical location
+        # ----------------------------------------------------
+
+        location = None
+
+
+        location_patterns = [
+
+            (
+                "right lower",
+                "right lower lung",
+            ),
+
+            (
+                "left lower",
+                "left lower lung",
+            ),
+
+            (
+                "right upper",
+                "right upper lung",
+            ),
+
+            (
+                "left upper",
+                "left upper lung",
+            ),
+
+            (
+                "right middle",
+                "right middle lung",
+            ),
+
+            (
+                "left mid",
+                "left mid lung",
+            ),
+        ]
+
+
+        for phrase, readable in (
+            location_patterns
+        ):
+
+            if phrase in context:
+
+                location = readable
+
+                break
+
+
+        findings.append(
+            {
+
+                "name":
+                    canonical_name,
+
+                "display_name":
+                    term.title(),
+
+                "status":
+                    status,
+
+                "location":
+                    location,
+
+                "evidence":
+                    evidence,
+
+                "plain_language":
+                    plain_language,
+            }
+        )
+
+
+    # --------------------------------------------------------
+    # Remove duplicate canonical findings
+    # --------------------------------------------------------
+
+    unique_findings = {}
+
+
+    for finding in findings:
+
+        if finding["name"] not in unique_findings:
+
+            unique_findings[
+                finding["name"]
+            ] = finding
+
+
+    findings = list(
+        unique_findings.values()
+    )
+
+
+    # --------------------------------------------------------
+    # Biomedical NER fallback
+    # --------------------------------------------------------
+
+    if not findings:
+
+        try:
+
+            from transformers import pipeline
+
+
+            ner_pipeline = pipeline(
+                "token-classification",
+                model=NLP_MODEL,
+                aggregation_strategy="simple",
+            )
+
+
+            entities = ner_pipeline(
+                text[:4000]
+            )
+
+
+            for entity in entities[:20]:
+
+                word = (
+                    entity
+                    .get("word", "")
+                    .strip()
+                )
+
+
+                if not word:
+
+                    continue
+
+
+                findings.append(
+                    {
+
+                        "name":
+                            word.lower()
+                            .replace(
+                                " ",
+                                "_",
+                            ),
+
+                        "display_name":
+                            word,
+
+                        "status":
+                            "uncertain",
+
+                        "location":
+                            None,
+
+                        "evidence":
+                            word,
+
+                        "plain_language":
+                            (
+                                "A biomedical term "
+                                "identified in the report. "
+                                "Its clinical meaning "
+                                "requires context."
+                            ),
+                    }
+                )
+
+
+        except Exception:
+
+            pass
+
+
+    # --------------------------------------------------------
+    # Nothing identified
+    # --------------------------------------------------------
+
+    if not findings:
+
+        findings.append(
+            {
+
+                "name":
+                    "no_normalized_findings",
+
+                "display_name":
+                    "No normalized findings",
+
+                "status":
+                    "uncertain",
+
+                "location":
+                    None,
+
+                "evidence":
+                    "",
+
+                "plain_language":
+                    (
+                        "The prototype did not identify "
+                        "one of its supported radiology "
+                        "finding patterns."
+                    ),
+            }
+        )
+
+
+    return findings
+
+
+# ============================================================
+# MULTIMODAL FUSION
+# ============================================================
+
+def compare_findings(
+    vision_findings,
+    report_findings,
+):
+
+    report_map = {
+
+        finding["name"]:
+            finding
+
+        for finding
+        in report_findings
+
+        if finding["name"]
+        != "no_normalized_findings"
     }
-    return json.dumps(payload, indent=2, ensure_ascii=False)
 
-# ---------- Sidebar ----------
-st.sidebar.title("🩻 Medical Visualizer")
+
+    comparisons = []
+
+
+    for vision in vision_findings:
+
+        name = vision["name"]
+
+
+        if name == "no_finding":
+
+            continue
+
+
+        probability = float(
+            vision["probability"]
+        )
+
+
+        image_positive = (
+            probability >= 0.5
+        )
+
+
+        if name not in report_map:
+
+            relationship = (
+                "not_mentioned"
+            )
+
+            report_status = (
+                "not mentioned"
+            )
+
+
+        else:
+
+            report_status = (
+                report_map[name]["status"]
+            )
+
+
+            if report_status == "uncertain":
+
+                relationship = "uncertain"
+
+
+            elif (
+                image_positive
+                and
+                report_status == "present"
+            ):
+
+                relationship = "consistent"
+
+
+            elif (
+                not image_positive
+                and
+                report_status == "absent"
+            ):
+
+                relationship = "consistent"
+
+
+            else:
+
+                relationship = (
+                    "potential_difference"
+                )
+
+
+        comparisons.append(
+            {
+
+                "finding":
+                    name,
+
+                "display_name":
+                    vision["display_name"],
+
+                "image_probability":
+                    probability,
+
+                "image":
+                    f"{probability:.0%}",
+
+                "report":
+                    report_status,
+
+                "relationship":
+                    relationship,
+            }
+        )
+
+
+    return comparisons
+
+
+# ============================================================
+# PLAIN LANGUAGE EXPLANATION
+# ============================================================
+
+def deterministic_summary(
+    report_findings,
+    comparisons,
+):
+
+    present = [
+
+        finding["display_name"]
+
+        for finding
+        in report_findings
+
+        if finding["status"]
+        == "present"
+    ]
+
+
+    absent = [
+
+        finding["display_name"]
+
+        for finding
+        in report_findings
+
+        if finding["status"]
+        == "absent"
+    ]
+
+
+    consistent = [
+
+        finding["display_name"]
+
+        for finding
+        in comparisons
+
+        if finding["relationship"]
+        == "consistent"
+    ]
+
+
+    parts = []
+
+
+    if present:
+
+        parts.append(
+            "The written report describes: "
+            + ", ".join(present)
+            + "."
+        )
+
+
+    if absent:
+
+        parts.append(
+            "The report specifically describes "
+            "as absent: "
+            + ", ".join(absent)
+            + "."
+        )
+
+
+    if consistent:
+
+        parts.append(
+            "The image-model outputs are directionally "
+            "consistent with the written report for: "
+            + ", ".join(consistent)
+            + "."
+        )
+
+
+    if not parts:
+
+        parts.append(
+            "The prototype could not generate "
+            "a detailed plain-language summary "
+            "from the supplied information."
+        )
+
+
+    parts.append(
+        "This is an AI-assisted educational explanation. "
+        "It is not a medical diagnosis and should not "
+        "be used for treatment or clinical decision-making."
+    )
+
+
+    return " ".join(
+        parts
+    )
+
+
+# ============================================================
+# OPTIONAL LLM EXPLANATION
+# ============================================================
+
+def generate_explanation(
+    report_findings,
+    comparisons,
+):
+
+    api_key = os.getenv(
+        "LLM_API_KEY"
+    )
+
+
+    provider = os.getenv(
+        "LLM_PROVIDER",
+        "",
+    ).lower()
+
+
+    # --------------------------------------------------------
+    # Free default mode
+    # --------------------------------------------------------
+
+    if (
+        not api_key
+        or provider != "openai"
+    ):
+
+        return deterministic_summary(
+            report_findings,
+            comparisons,
+        )
+
+
+    # --------------------------------------------------------
+    # Optional OpenAI API
+    # --------------------------------------------------------
+
+    try:
+
+        from openai import OpenAI
+
+
+        client = OpenAI(
+            api_key=api_key
+        )
+
+
+        structured_data = {
+
+            "report_findings":
+                report_findings,
+
+            "image_report_comparisons":
+                comparisons,
+        }
+
+
+        response = (
+            client
+            .chat
+            .completions
+            .create(
+
+                model=os.getenv(
+                    "LLM_MODEL",
+                    "gpt-5-mini",
+                ),
+
+                messages=[
+
+                    {
+                        "role":
+                            "system",
+
+                        "content":
+                            (
+                                "Explain radiology "
+                                "information for a general "
+                                "audience. The written "
+                                "clinician report is the "
+                                "primary source. AI image "
+                                "outputs are predictions, "
+                                "not diagnoses. Do not "
+                                "invent findings, provide "
+                                "treatment advice, or "
+                                "claim clinical accuracy."
+                            ),
+                    },
+
+                    {
+                        "role":
+                            "user",
+
+                        "content":
+                            json.dumps(
+                                structured_data,
+                                ensure_ascii=False,
+                            ),
+                    },
+                ],
+
+                temperature=0.1,
+            )
+        )
+
+
+        return (
+            response
+            .choices[0]
+            .message
+            .content
+            .strip()
+        )
+
+
+    except Exception:
+
+        return deterministic_summary(
+            report_findings,
+            comparisons,
+        )
+
+
+# ============================================================
+# DEMO DATA
+# ============================================================
+
+def demo_result():
+
+    study_id = (
+        "DEMO-"
+        + uuid.uuid4()
+        .hex[:6]
+        .upper()
+    )
+
+
+    vision = [
+
+        {
+            "name":
+                "lung_opacity",
+
+            "display_name":
+                "Lung Opacity",
+
+            "probability":
+                0.78,
+
+            "status":
+                "elevated",
+
+            "source":
+                "Illustrative demo",
+
+            "explanation":
+                "Illustrative demo probability only.",
+        },
+
+        {
+            "name":
+                "pleural_effusion",
+
+            "display_name":
+                "Pleural Effusion",
+
+            "probability":
+                0.10,
+
+            "status":
+                "low",
+
+            "source":
+                "Illustrative demo",
+
+            "explanation":
+                "Illustrative demo probability only.",
+        },
+
+        {
+            "name":
+                "cardiomegaly",
+
+            "display_name":
+                "Cardiomegaly",
+
+            "probability":
+                0.21,
+
+            "status":
+                "low",
+
+            "source":
+                "Illustrative demo",
+
+            "explanation":
+                "Illustrative demo probability only.",
+        },
+    ]
+
+
+    report = [
+
+        {
+            "name":
+                "lung_opacity",
+
+            "display_name":
+                "Lung Opacity",
+
+            "status":
+                "present",
+
+            "location":
+                "right lower lung",
+
+            "evidence":
+                (
+                    "Patchy right lower lobe "
+                    "airspace opacity is described."
+                ),
+
+            "plain_language":
+                REPORT_TERMS[
+                    "lung opacity"
+                ][1],
+        },
+
+        {
+            "name":
+                "pleural_effusion",
+
+            "display_name":
+                "Pleural Effusion",
+
+            "status":
+                "absent",
+
+            "location":
+                None,
+
+            "evidence":
+                "No pleural effusion is described.",
+
+            "plain_language":
+                REPORT_TERMS[
+                    "pleural effusion"
+                ][1],
+        },
+    ]
+
+
+    comparisons = [
+
+        {
+            "finding":
+                "lung_opacity",
+
+            "display_name":
+                "Lung Opacity",
+
+            "image_probability":
+                0.78,
+
+            "image":
+                "78%",
+
+            "report":
+                "present",
+
+            "relationship":
+                "consistent",
+        },
+
+        {
+            "finding":
+                "pleural_effusion",
+
+            "display_name":
+                "Pleural Effusion",
+
+            "image_probability":
+                0.10,
+
+            "image":
+                "10%",
+
+            "report":
+                "absent",
+
+            "relationship":
+                "consistent",
+        },
+
+        {
+            "finding":
+                "cardiomegaly",
+
+            "display_name":
+                "Cardiomegaly",
+
+            "image_probability":
+                0.21,
+
+            "image":
+                "21%",
+
+            "report":
+                "not mentioned",
+
+            "relationship":
+                "not_mentioned",
+        },
+    ]
+
+
+    return {
+
+        "study_id":
+            study_id,
+
+        "demo":
+            True,
+
+        "summary":
+            (
+                "This illustrative case contains "
+                "a reported lung opacity and no "
+                "reported pleural effusion. The "
+                "example image-model outputs are "
+                "directionally consistent with "
+                "those example statements. These "
+                "values are synthetic and are not "
+                "a diagnosis."
+            ),
+
+        "vision_findings":
+            vision,
+
+        "report_findings":
+            report,
+
+        "comparisons":
+            comparisons,
+
+        "medical_terms":
+            [
+
+                {
+                    "term":
+                        "Lung opacity",
+
+                    "plain_language":
+                        REPORT_TERMS[
+                            "lung opacity"
+                        ][1],
+                },
+
+                {
+                    "term":
+                        "Pleural effusion",
+
+                    "plain_language":
+                        REPORT_TERMS[
+                            "pleural effusion"
+                        ][1],
+                },
+
+                {
+                    "term":
+                        "Cardiomegaly",
+
+                    "plain_language":
+                        REPORT_TERMS[
+                            "cardiomegaly"
+                        ][1],
+                },
+            ],
+
+        "limitations":
+            [
+
+                "Demo values are illustrative.",
+
+                "Model probabilities are not clinical certainty.",
+
+                "This prototype is not clinically validated.",
+            ],
+
+        "models":
+            {
+
+                "vision":
+                    VISION_MODEL,
+
+                "nlp":
+                    NLP_MODEL,
+
+                "explanation":
+                    "Deterministic / optional LLM API",
+            },
+    }
+
+
+# ============================================================
+# COMPLETE ANALYSIS PIPELINE
+# ============================================================
+
+def analyze_case(
+    image_bytes,
+    report_text,
+):
+
+    study_id = (
+        "STUDY-"
+        + uuid.uuid4()
+        .hex[:8]
+        .upper()
+    )
+
+
+    # --------------------------------------------------------
+    # Computer vision
+    # --------------------------------------------------------
+
+    vision_findings = analyze_xray(
+        image_bytes
+    )
+
+
+    # --------------------------------------------------------
+    # Report NLP
+    # --------------------------------------------------------
+
+    report_findings = (
+        extract_report_findings(
+            report_text
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Multimodal fusion
+    # --------------------------------------------------------
+
+    comparisons = (
+        compare_findings(
+            vision_findings,
+            report_findings,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Explanation
+    # --------------------------------------------------------
+
+    summary = (
+        generate_explanation(
+            report_findings,
+            comparisons,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Medical terminology
+    # --------------------------------------------------------
+
+    medical_terms = []
+
+    seen = set()
+
+
+    for finding in report_findings:
+
+        if finding["name"] in seen:
+
+            continue
+
+
+        seen.add(
+            finding["name"]
+        )
+
+
+        medical_terms.append(
+            {
+
+                "term":
+                    finding["display_name"],
+
+                "plain_language":
+                    finding["plain_language"],
+            }
+        )
+
+
+    return {
+
+        "study_id":
+            study_id,
+
+        "demo":
+            False,
+
+        "summary":
+            summary,
+
+        "vision_findings":
+            vision_findings,
+
+        "report_findings":
+            report_findings,
+
+        "comparisons":
+            comparisons,
+
+        "medical_terms":
+            medical_terms,
+
+        "limitations":
+            [
+
+                "AI observations are not diagnoses.",
+
+                "The written radiology report "
+                "is treated as the primary clinical source.",
+
+                "The 0.5 threshold is an engineering "
+                "display threshold, not a clinical threshold.",
+
+                "This prototype has not undergone "
+                "clinical validation.",
+
+            ],
+
+        "models":
+            {
+
+                "vision":
+                    VISION_MODEL,
+
+                "nlp":
+                    NLP_MODEL,
+
+                "explanation":
+                    (
+                        os.getenv(
+                            "LLM_MODEL",
+                            "Deterministic / optional LLM API",
+                        )
+                    ),
+            },
+    }
+
+
+# ============================================================
+# JSON EXPORT
+# ============================================================
+
+def export_json(
+    result
+):
+
+    return json.dumps(
+        result,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title(
+    "🩻 Medical Visualizer"
+)
+
+
 page = st.sidebar.radio(
     "Navigate",
-    ["Analyze", "History", "Evaluation", "Models & Methodology", "About"],
+    [
+
+        "Analyze",
+
+        "History",
+
+        "Evaluation",
+
+        "Models & Methodology",
+
+        "About",
+
+    ],
 )
 
+
 if "history" not in st.session_state:
+
     st.session_state.history = []
 
-# ---------- Analyze ----------
+
+# ============================================================
+# ANALYZE PAGE
+# ============================================================
+
 if page == "Analyze":
-    st.markdown("""
-    <div class="hero">
-      <h1>Multimodal Medical Report Visualizer</h1>
-      <p>Explore how pretrained computer-vision and biomedical NLP models
-      can connect chest X-ray observations with radiology reports and
-      produce patient-friendly explanations.</p>
-    </div>
-    """, unsafe_allow_html=True)
+
+    st.markdown(
+        """
+<div class="hero">
+
+<h1>
+Multimodal Medical Report Visualizer
+</h1>
+
+<p>
+Explore how a pretrained chest-X-ray computer-vision
+model and biomedical report analysis can be combined
+to make radiology information easier to inspect.
+</p>
+
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
 
     st.write("")
-    c1, c2 = st.columns(2)
 
-    with c1:
-        st.subheader("1. Chest X-ray")
+
+    left, right = st.columns(
+        2
+    )
+
+
+    # ========================================================
+    # X-RAY
+    # ========================================================
+
+    with left:
+
+        st.subheader(
+            "1. Chest X-ray"
+        )
+
+
         xray = st.file_uploader(
-            "Upload PNG/JPG/JPEG",
-            type=["png", "jpg", "jpeg"],
-            key="xray",
+            "Upload PNG / JPG / JPEG",
+
+            type=[
+                "png",
+                "jpg",
+                "jpeg",
+            ],
+
+            key="xray_upload",
         )
+
+
         if xray:
-            st.image(xray, caption="Uploaded X-ray", use_container_width=True)
 
-    with c2:
-        st.subheader("2. Radiology report")
-        report_file = st.file_uploader(
-            "Upload PDF/TXT",
-            type=["pdf", "txt"],
-            key="report",
-        )
-        report_text = st.text_area(
-            "Or paste/edit the report",
-            height=220,
-            placeholder="Paste the radiology report here...",
-        )
+            st.image(
+                xray,
 
-        if report_file and report_file.type == "application/pdf":
-            extracted = extract_pdf_text(report_file)
-            if extracted and not report_text.strip():
-                report_text = extracted
-        elif report_file:
-            try:
-                if not report_text.strip():
-                    report_text = report_file.read().decode("utf-8", errors="ignore")
-            except Exception:
-                st.warning("Could not read the text file.")
+                caption="Uploaded X-ray",
 
-        if report_text.strip():
-            st.text_area(
-                "Extracted / editable report",
-                value=report_text,
-                height=180,
-                key="report_preview",
+                use_container_width=True,
             )
+
+
+    # ========================================================
+    # REPORT
+    # ========================================================
+
+    with right:
+
+        st.subheader(
+            "2. Radiology report"
+        )
+
+
+        report_file = st.file_uploader(
+            "Upload PDF / TXT",
+
+            type=[
+                "pdf",
+                "txt",
+            ],
+
+            key="report_upload",
+        )
+
+
+        uploaded_report = (
+            read_report(
+                report_file
+            )
+        )
+
+
+        report_text = st.text_area(
+            "Paste or edit the report",
+
+            value=uploaded_report,
+
+            height=240,
+
+            placeholder=(
+                "Example: No pleural effusion. "
+                "Patchy right lower lobe opacity..."
+            ),
+        )
+
 
     st.divider()
 
-    d1, d2, d3 = st.columns([1, 1, 2])
-    with d1:
-        demo = st.button("🎬 Load Demo Case", use_container_width=True)
-    with d2:
-        analyze = st.button("🔬 Analyze Study", type="primary", use_container_width=True)
-    with d3:
-        st.markdown(
-            '<div class="small-muted">Educational/research prototype — '
-            'not a diagnostic system.</div>',
-            unsafe_allow_html=True,
+
+    col1, col2, col3 = st.columns(
+        [1, 1, 2]
+    )
+
+
+    with col1:
+
+        demo_clicked = st.button(
+            "🎬 Load Demo Case",
+
+            use_container_width=True,
         )
 
-    if demo:
-        st.session_state.demo_case = get_demo_case()
-        st.session_state.result = st.session_state.demo_case["result"]
-        st.rerun()
 
-    if analyze:
+    with col2:
+
+        analyze_clicked = st.button(
+            "🔬 Analyze Study",
+
+            type="primary",
+
+            use_container_width=True,
+        )
+
+
+    with col3:
+
+        st.caption(
+            "Educational/research prototype — "
+            "not a diagnostic system."
+        )
+
+
+    # ========================================================
+    # DEMO
+    # ========================================================
+
+    if demo_clicked:
+
+        result = demo_result()
+
+        st.session_state.result = result
+
+
+    # ========================================================
+    # REAL ANALYSIS
+    # ========================================================
+
+    if analyze_clicked:
+
         if not xray:
-            st.error("Please upload a chest X-ray.")
+
+            st.error(
+                "Please upload a chest X-ray."
+            )
+
+
         elif not report_text.strip():
-            st.error("Please upload or paste a radiology report.")
+
+            st.error(
+                "Please upload or paste "
+                "a radiology report."
+            )
+
+
         else:
-            with st.status("Running multimodal analysis...", expanded=True) as status:
-                st.write("✓ Image loaded")
-                st.write("✓ Report extracted")
-                result = analyze_case(xray, report_text)
-                st.write("✓ Vision inference")
-                st.write("✓ Biomedical NLP")
-                st.write("✓ Finding normalization")
-                st.write("✓ Image/report comparison")
-                st.write("✓ Explanation generation")
-                status.update(label="Analysis complete", state="complete")
-            st.session_state.result = result
-            st.session_state.history.insert(0, result)
-            st.rerun()
 
-    result = st.session_state.get("result")
+            with st.status(
+                "Running multimodal analysis...",
+                expanded=True,
+            ) as status:
+
+                try:
+
+                    st.write(
+                        "✓ Image loaded"
+                    )
+
+
+                    st.write(
+                        "✓ Report loaded"
+                    )
+
+
+                    image_bytes = (
+                        xray.getvalue()
+                    )
+
+
+                    result = analyze_case(
+                        image_bytes,
+                        report_text,
+                    )
+
+
+                    st.write(
+                        "✓ DenseNet-121 vision inference"
+                    )
+
+
+                    st.write(
+                        "✓ Report parsing / biomedical NLP"
+                    )
+
+
+                    st.write(
+                        "✓ Finding normalization"
+                    )
+
+
+                    st.write(
+                        "✓ Image ↔ report comparison"
+                    )
+
+
+                    st.write(
+                        "✓ Explanation generation"
+                    )
+
+
+                    status.update(
+                        label="Analysis complete",
+
+                        state="complete",
+                    )
+
+
+                    st.session_state.result = (
+                        result
+                    )
+
+
+                    st.session_state.history.insert(
+                        0,
+                        result,
+                    )
+
+
+                except Exception as exc:
+
+                    status.update(
+                        label="Analysis failed",
+
+                        state="error",
+                    )
+
+
+                    st.error(
+                        "The live model pipeline failed."
+                    )
+
+
+                    # This is deliberately visible so
+                    # deployment/model problems can be
+                    # diagnosed instead of hidden.
+
+                    st.exception(
+                        exc
+                    )
+
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    result = (
+        st.session_state.get(
+            "result"
+        )
+    )
+
+
     if result:
+
         st.divider()
-        st.header(f"Study {result['study_id']}")
+
+
+        st.header(
+            f"Study {result['study_id']}"
+        )
+
+
         if result.get("demo"):
-            st.info("Demo mode: these results are illustrative and are not from a live clinical case.")
 
-        # Summary
-        st.subheader("Plain-language summary")
-        st.info(result["summary"])
+            st.info(
+                "Demo mode: all values are illustrative."
+            )
 
-        # Vision findings
-        st.subheader("AI visual findings")
-        cols = st.columns(3)
-        for i, finding in enumerate(result["vision_findings"][:6]):
-            with cols[i % 3]:
-                render_finding_card(finding)
 
-        # Report findings
-        st.subheader("Radiology report findings")
-        for finding in result["report_findings"]:
-            with st.container(border=True):
-                name = finding["name"].replace("_", " ").title()
-                st.markdown(f"### {name}")
-                st.write(f"**Status:** {finding['status'].replace('_', ' ').title()}")
-                if finding.get("location"):
-                    st.write(f"**Location:** {finding['location']}")
-                if finding.get("evidence"):
-                    st.caption(f"Report evidence: {finding['evidence']}")
+        # ----------------------------------------------------
+        # SUMMARY
+        # ----------------------------------------------------
 
-        # Comparison
-        st.subheader("Image ↔ report comparison")
+        st.subheader(
+            "Plain-language summary"
+        )
+
+
+        st.info(
+            result["summary"]
+        )
+
+
+        # ----------------------------------------------------
+        # AI FINDINGS
+        # ----------------------------------------------------
+
+        st.subheader(
+            "AI visual findings"
+        )
+
+
+        vision = (
+            result[
+                "vision_findings"
+            ]
+        )
+
+
+        # Display top 9 findings
+
+        top_findings = vision[:9]
+
+
+        for start in range(
+            0,
+            len(top_findings),
+            3,
+        ):
+
+            cols = st.columns(
+                3
+            )
+
+
+            for offset, col in enumerate(
+                cols
+            ):
+
+                index = (
+                    start
+                    + offset
+                )
+
+
+                if (
+                    index
+                    >= len(top_findings)
+                ):
+
+                    continue
+
+
+                finding = (
+                    top_findings[
+                        index
+                    ]
+                )
+
+
+                with col:
+
+                    with st.container(
+                        border=True
+                    ):
+
+                        st.markdown(
+                            "### "
+                            + finding[
+                                "display_name"
+                            ]
+                        )
+
+
+                        st.metric(
+                            "Model probability",
+
+                            f"{finding['probability']:.1%}",
+                        )
+
+
+                        st.progress(
+                            min(
+                                1.0,
+
+                                max(
+                                    0.0,
+
+                                    finding[
+                                        "probability"
+                                    ],
+                                ),
+                            )
+                        )
+
+
+                        st.caption(
+                            finding[
+                                "explanation"
+                            ]
+                        )
+
+
+        # ----------------------------------------------------
+        # REPORT FINDINGS
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Radiology report findings"
+        )
+
+
+        for finding in (
+            result[
+                "report_findings"
+            ]
+        ):
+
+            with st.container(
+                border=True
+            ):
+
+                st.markdown(
+                    "### "
+                    + finding[
+                        "display_name"
+                    ]
+                )
+
+
+                st.write(
+                    "**Status:** "
+                    + finding[
+                        "status"
+                    ]
+                    .replace(
+                        "_",
+                        " ",
+                    )
+                    .title()
+                )
+
+
+                if finding.get(
+                    "location"
+                ):
+
+                    st.write(
+                        "**Location:** "
+                        + finding[
+                            "location"
+                        ]
+                    )
+
+
+                if finding.get(
+                    "evidence"
+                ):
+
+                    st.caption(
+                        "Report evidence: "
+                        + finding[
+                            "evidence"
+                        ]
+                    )
+
+
+        # ----------------------------------------------------
+        # COMPARISON
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Image ↔ report comparison"
+        )
+
+
         comparison_rows = []
-        for c in result["comparisons"]:
-            comparison_rows.append({
-                "Finding": c["finding"].replace("_", " ").title(),
-                "Image model": c["image"],
-                "Report": c["report"].replace("_", " ").title(),
-                "Relationship": c["relationship"].replace("_", " ").title(),
-            })
-        st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
 
-        # Medical terms
-        st.subheader("Medical terminology")
-        for term in result["medical_terms"]:
-            with st.expander(term["term"]):
-                st.write(term["plain_language"])
 
-        # Chart
-        st.subheader("Model probability profile")
-        chart_df = pd.DataFrame([
-            {"Finding": x["name"].replace("_", " ").title(), "Probability": x["probability"]}
-            for x in result["vision_findings"] if x.get("probability") is not None
-        ])
-        if not chart_df.empty:
-            st.bar_chart(chart_df.set_index("Finding"))
+        for item in (
+            result[
+                "comparisons"
+            ]
+        ):
 
-        # Export
-        st.subheader("Export")
+            comparison_rows.append(
+                {
+
+                    "Finding":
+                        item[
+                            "display_name"
+                        ],
+
+                    "Image model":
+                        item[
+                            "image"
+                        ],
+
+                    "Report":
+                        item[
+                            "report"
+                        ].title(),
+
+                    "Relationship":
+                        item[
+                            "relationship"
+                        ]
+                        .replace(
+                            "_",
+                            " ",
+                        )
+                        .title(),
+                }
+            )
+
+
+        if comparison_rows:
+
+            st.dataframe(
+                pd.DataFrame(
+                    comparison_rows
+                ),
+
+                use_container_width=True,
+
+                hide_index=True,
+            )
+
+
+        st.caption(
+            "Consistent means the prototype outputs "
+            "point in the same direction for that "
+            "finding. It does not establish clinical "
+            "accuracy and does not imply that either "
+            "source is correct."
+        )
+
+
+        # ----------------------------------------------------
+        # MEDICAL TERMS
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Medical terminology"
+        )
+
+
+        for term in (
+            result[
+                "medical_terms"
+            ]
+        ):
+
+            with st.expander(
+                term["term"]
+            ):
+
+                st.write(
+                    term[
+                        "plain_language"
+                    ]
+                )
+
+
+        # ----------------------------------------------------
+        # CHART
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Model probability profile"
+        )
+
+
+        chart_data = pd.DataFrame(
+            [
+
+                {
+
+                    "Finding":
+                        item[
+                            "display_name"
+                        ],
+
+                    "Probability":
+                        item[
+                            "probability"
+                        ],
+
+                }
+
+                for item
+                in vision
+
+            ]
+        )
+
+
+        if not chart_data.empty:
+
+            st.bar_chart(
+                chart_data.set_index(
+                    "Finding"
+                )
+            )
+
+
+        # ----------------------------------------------------
+        # EXPORT
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Export"
+        )
+
+
         st.download_button(
             "Download JSON analysis",
-            data=make_export(result),
-            file_name=f"{result['study_id']}.json",
+
+            data=export_json(
+                result
+            ),
+
+            file_name=(
+                f"{result['study_id']}.json"
+            ),
+
             mime="application/json",
         )
 
+
+        # ----------------------------------------------------
+        # DISCLAIMER
+        # ----------------------------------------------------
+
         st.markdown(
-            '<div class="disclaimer"><strong>Research prototype:</strong> '
-            'AI observations are model outputs, not diagnoses. The clinician/radiology '
-            'report is the primary clinical source. Do not use this application for '
-            'treatment or medical decision-making.</div>',
+            """
+<div class="disclaimer">
+
+<b>Responsible use:</b>
+
+AI observations are model outputs,
+not diagnoses.
+
+The clinician/radiology report is
+the primary clinical source.
+
+Do not use this application for
+treatment or medical decision-making.
+
+Do not upload identifiable
+patient information.
+
+</div>
+""",
             unsafe_allow_html=True,
         )
 
-# ---------- History ----------
+
+# ============================================================
+# HISTORY PAGE
+# ============================================================
+
 elif page == "History":
-    st.title("Study History")
-    history = st.session_state.history
-    if not history:
-        st.info("No analyses in this browser session yet. Try the Demo Case.")
+
+    st.title(
+        "Study History"
+    )
+
+
+    if not st.session_state.history:
+
+        st.info(
+            "No analyses in this browser "
+            "session yet."
+        )
+
+
     else:
-        for r in history:
-            with st.expander(f"{r['study_id']} — {r['summary'][:90]}"):
-                st.write(r["summary"])
-                st.write(f"Comparisons: {len(r['comparisons'])}")
-                st.download_button(
-                    "Download JSON",
-                    make_export(r),
-                    file_name=f"{r['study_id']}.json",
-                    mime="application/json",
-                    key=f"download_{r['study_id']}",
+
+        for result in (
+            st.session_state.history
+        ):
+
+            with st.expander(
+                (
+                    f"{result['study_id']} — "
+                    f"{result['summary'][:100]}"
+                )
+            ):
+
+                st.write(
+                    result[
+                        "summary"
+                    ]
                 )
 
-# ---------- Evaluation ----------
+
+                st.download_button(
+                    "Download JSON",
+
+                    data=export_json(
+                        result
+                    ),
+
+                    file_name=(
+                        f"{result['study_id']}.json"
+                    ),
+
+                    mime="application/json",
+
+                    key=(
+                        "history_"
+                        + result[
+                            "study_id"
+                        ]
+                    ),
+                )
+
+
+# ============================================================
+# EVALUATION PAGE
+# ============================================================
+
 elif page == "Evaluation":
-    st.title("Evaluation")
-    st.write(
-        "This page is designed for a small, transparent research evaluation. "
-        "Do not report fabricated metrics."
-    )
-    demo = get_demo_case()
-    rows = [
-        {
-            "Finding": c["finding"].replace("_", " ").title(),
-            "Image probability": c["image_probability"],
-            "Report status": c["report"],
-            "Relationship": c["relationship"].replace("_", " ").title(),
-        }
-        for c in demo["result"]["comparisons"]
-    ]
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    if not df.empty:
-        consistent = (df["Relationship"] == "Consistent").sum()
-        st.metric("Demo-case consistent relationships", f"{consistent}/{len(df)}")
-    st.caption(
-        "The demo evaluation is illustrative. For a real evaluation, populate "
-        "evaluation/ with an appropriately licensed/de-identified dataset and "
-        "compute metrics from actual observations."
+
+    st.title(
+        "Evaluation"
     )
 
-# ---------- Models ----------
+
+    st.write(
+        "This page deliberately avoids "
+        "claiming clinical accuracy from "
+        "agreement with a radiology report."
+    )
+
+
+    st.markdown(
+        """
+### Proper evaluation design
+
+For a real research evaluation:
+
+1. Use an appropriately licensed,
+   de-identified dataset.
+
+2. Define the label ontology before testing.
+
+3. Keep patient-level train/validation/test
+   separation.
+
+4. Use an independent reference standard.
+
+5. Report AUROC, sensitivity, specificity,
+   and confidence intervals where appropriate.
+
+6. Evaluate uncertain and missing labels.
+
+7. Perform subgroup analysis where the
+   dataset supports it.
+
+The built-in demo is illustrative and
+is not a clinical benchmark.
+"""
+    )
+
+
+# ============================================================
+# MODELS & METHODOLOGY
+# ============================================================
+
 elif page == "Models & Methodology":
-    st.title("Models & Methodology")
-    st.markdown("""
+
+    st.title(
+        "Models & Methodology"
+    )
+
+
+    st.markdown(
+        f"""
 ### Computer vision
-A pretrained chest-X-ray classifier is used for image-level finding probabilities.
-The model is not trained by this project.
+
+**Model:**
+`{VISION_MODEL}`
+
+The application uses a pretrained
+DenseNet-121 chest-X-ray multi-label
+classifier hosted on Hugging Face.
+
+The model predicts 14 CheXpert-style
+labels.
+
+The application does not train the
+model.
 
 ### Biomedical NLP
-A pretrained biomedical named-entity model is used to identify medical concepts
-from the written report. A lightweight normalization/negation layer maps common
-radiology expressions into canonical findings.
+
+**Model:**
+`{NLP_MODEL}`
+
+The report pipeline first applies
+radiology-specific normalization and
+local-context negation handling.
+
+The biomedical NER model is used only
+as a fallback when the supported
+radiology vocabulary does not identify
+a finding.
 
 ### Multimodal fusion
-The project compares the two independently produced representations:
 
-`image findings + report findings → relationship`
-
-Possible relationships:
-
-- Consistent
-- Potential difference
-- Not mentioned
-- Uncertain
-
-### Generative explanation
-An optional LLM API converts structured findings into plain-language explanations.
-The LLM is explicitly instructed not to diagnose, invent findings, or override
-the clinician report.
-
-### Important
-Model probabilities are not clinical certainty. This is an educational/research
-prototype and has not undergone clinical validation.
-""")
-    st.code("""
-X-ray
-  ↓
-Image preprocessing
-  ↓
-Pretrained vision model
-  ↓
+```text
+Chest X-ray
+      |
+      v
+DenseNet-121
+      |
+      v
 Image findings
-
-Radiology report
-  ↓
-PDF/text extraction
-  ↓
-Biomedical NLP + negation
-  ↓
+      |
+      |
+      +----------------------+
+                             |
+                             v
+                      Normalization
+                             ^
+                             |
+                             |
+Radiology report             |
+      |                      |
+      v                      |
+Report NLP ------------------+
+      |
+      v
 Report findings
-
-Image findings + report findings
-  ↓
-Fusion / comparison
-  ↓
-LLM explanation
-  ↓
-Interactive dashboard
-""")
-
-# ---------- About ----------
-else:
-    st.title("About the Project")
-    st.markdown("""
-## Research question
-
-Can pretrained computer-vision and biomedical NLP models be combined to connect
-chest X-ray observations with written radiology findings and produce a clearer,
-patient-friendly explanation?
-
-## Why this project exists
-
-Radiology reports contain specialized terminology. At the same time, modern
-vision models can extract structured signals from images. This project explores
-how the two modalities can be represented separately and then compared.
-
-## Responsible AI
-
-This project does not replace a radiologist or clinician. It is not a medical
-device and is not clinically validated.
-
-Do not upload real patient-identifying information.
-
-## Technology
-
-Python · Streamlit · PyTorch · Hugging Face Transformers · Pillow · OpenCV ·
-PyMuPDF · Pandas · Plotly · LLM API
-""")
+      |
+      v
+Image ↔ Report comparison
+      |
+      v
+Plain-language explanation
