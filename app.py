@@ -2482,75 +2482,81 @@ elif page == "Limitations":
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        '<div class="app-title">Limitations</div>',
-        unsafe_allow_html=True
-    )
+    st.title("Limitations")
 
-    st.markdown(
-        """
-        <div class="app-subtitle">
-            Understanding what the system cannot establish is part
-            of the design of a responsible medical AI prototype.
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.write(
+        "Understanding what the system cannot establish is "
+        "part of the design of a responsible medical AI prototype."
     )
 
     limitations = [
         (
             "Not clinically validated",
-            "The application has not undergone clinical validation, regulatory review or prospective testing."
+            "The application has not undergone clinical validation, "
+            "regulatory review, or prospective clinical testing."
         ),
         (
             "Model scores are not diagnoses",
-            "The vision model produces research-model scores. These should not be interpreted as confirmed clinical findings."
+            "The vision model produces research-model scores. "
+            "These values should not be interpreted as confirmed "
+            "clinical findings or diagnoses."
         ),
         (
             "Report agreement is not ground truth",
-            "A model agreeing with a radiology report does not independently establish model correctness."
+            "A model agreeing with a radiology report does not "
+            "independently establish that the model prediction is correct."
         ),
         (
             "Dataset shift",
-            "Performance can change across hospitals, scanners, populations, acquisition protocols and disease prevalence."
+            "Model behavior can change across hospitals, scanners, "
+            "patient populations, acquisition protocols, and disease prevalence."
         ),
         (
             "Text extraction limitations",
-            "Simple terminology and context rules cannot represent every form of clinical language."
+            "The report-processing layer uses terminology normalization "
+            "and contextual rules. It cannot represent every form of "
+            "clinical language or reasoning."
         ),
         (
             "No treatment recommendations",
-            "The system intentionally does not recommend medication, treatment or clinical management."
+            "The system intentionally does not recommend medication, "
+            "treatment, or clinical management."
         ),
         (
             "No persistent patient database",
-            "The prototype stores case history only within the current session."
+            "The prototype stores case history only within the current "
+            "browser session and does not implement a persistent patient database."
         ),
         (
             "Public deployment",
-            "Users should not upload identifiable patient information to a public research deployment."
+            "Identifiable patient information should not be uploaded "
+            "to a publicly accessible research deployment."
         ),
     ]
 
     for title, description in limitations:
 
-        st.markdown(
-            f"""
-            <div class="surface">
+        with st.container(border=True):
 
-                <h3 style="margin-top:0;">
-                    {title}
-                </h3>
+            st.subheader(title)
 
-                <div class="small-note">
-                    {description}
-                </div>
+            st.write(description)
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    st.divider()
 
+    st.subheader("Responsible interpretation")
+
+    st.write(
+        "The purpose of this prototype is to investigate how "
+        "computer vision, clinical language processing, and "
+        "structured multimodal comparison can be integrated into "
+        "an inspectable research system."
+    )
+
+    st.write(
+        "The application is not intended to replace radiologists, "
+        "clinical judgment, or established medical workflows."
+    )
 
 # ============================================================
 # PAGE: ABOUT
